@@ -62,8 +62,11 @@ command line: the shell's `print` verb targets only the default printer, and
 the spooler rejects raw PDF unless the device speaks PostScript or PDF, which
 most desk lasers and inkjets do not. So the agent tries, in order:
 
-1. `SumatraPDF.exe -print-to "<printer>" -silent` — bundled beside the binary
-   by the installer, or found at a configured `helperPath`.
+1. `SumatraPDF.exe -print-to "<printer>" -silent` — shipped beside the binary,
+   or found at a configured `helperPath`. `./fetch-helper.sh` downloads the
+   pinned version and verifies its SHA-256; the binary is never committed.
+   See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) — it is GPLv3, which
+   places real obligations on the installer.
 2. The shell's `printto` verb, which works when a reader that registers it is
    installed (Acrobat and Foxit do; Edge does not).
 3. Neither → answers `503 no_pdf_helper`, and Sally falls back to the browser
@@ -79,12 +82,28 @@ than no dropdown at all.
 > that ships it must carry its licence text and a written offer for its source.
 > Settle this before the first release build.
 
+## Distribution
+
+Binaries are published to the shared desktop-agent bucket and CloudFront
+distribution defined in `infra/sst.config.ts`, under the `/print-agent/`
+prefix — the same infrastructure the Sally Tally Connector uses under `/tally/`.
+The stack outputs `PrintAgentWindowsUrl` and `PrintAgentMacUrl`; the web app
+receives them as env vars.
+
+The agent repos are private, so GitHub Releases can't serve customers directly:
+CI builds and signs, then uploads here.
+
 ## Building
 
 ```bash
+./fetch-helper.sh       # pinned SumatraPDF -> dist/windows/ (build.sh calls it)
 ./build.sh              # dev build
 VERSION=1.2.0 ./build.sh
 ```
+
+`dist/windows/` is what the Windows installer packages: the agent plus the PDF
+helper it needs. Without the helper the agent still runs, reports
+`canPrint:false`, and Sally stays on the browser print path.
 
 Pure Go, zero dependencies, `CGO_ENABLED=0`, so one machine cross-compiles
 Windows (amd64/arm64) and macOS (amd64/arm64, plus a universal binary when run
@@ -112,11 +131,18 @@ this can go on the website:
   start-at-login — a `Run` key or Startup entry on Windows (a *Service* is the
   wrong choice: session 0 has no user profile and cannot see per-user printer
   connections), a LaunchAgent with `RunAtLoad`/`KeepAlive` on macOS.
-- **Bundling SumatraPDF** on Windows, with the licence obligation above.
 - **An update path**, or the agent rots. The protocol is small and versioned
-  (`/v1`) specifically so an old agent keeps working.
-- **A download page** in the web app, and a "Direct printing is off" hint in
-  the print dialog linking to it.
+  (`/v1`) specifically so an old agent keeps working. Follow the Tally
+  connector's `latest.json` shape (version, root-relative url, sha256,
+  minVersion, mandatory, releasedAt) so both agents update the same way.
+- **A "Direct printing is off" hint** in the print dialog, linking to the
+  installer. The URLs are already wired through as
+  `NEXT_PUBLIC_PRINT_AGENT_WINDOWS_URL` / `..._MAC_URL`.
+- **A real print on paper.** Everything up to the spooler is verified —
+  enumeration, refusals, `canPrint` flipping true with the helper present — but
+  no sheet has actually come out of a printer yet.
+- **Running it on a Mac at all.** The darwin builds cross-compile; they have
+  never been executed.
 
 ## Configuration
 

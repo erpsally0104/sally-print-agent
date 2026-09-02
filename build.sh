@@ -43,6 +43,15 @@ build windows arm64 .exe
 build darwin amd64
 build darwin arm64
 
+# The Windows build cannot print without the PDF helper, so fetch it as part of
+# the build rather than leaving it to the packaging step to remember. Skipped
+# without network -- the agent then reports canPrint:false and Sally falls back.
+if ./fetch-helper.sh; then
+  cp "$OUT/windows/SumatraPDF.exe" "$OUT/" 2>/dev/null || true
+else
+  echo "  WARNING: PDF helper not fetched -- the Windows build cannot print" >&2
+fi
+
 # A universal binary spares the download page from asking users which Mac they
 # have. lipo only exists on macOS, so elsewhere the two slices ship as they are.
 if command -v lipo >/dev/null 2>&1; then
