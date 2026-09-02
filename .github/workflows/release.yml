@@ -81,14 +81,23 @@ jobs:
 
       # SumatraPDF is GPLv3 and we redistribute it, so its licence must travel
       # with the binary. Fetched from the pinned tag, not from HEAD.
+      #
+      # The version is read out of fetch-helper.sh so the licence can never
+      # describe a different build than the exe sitting beside it. Upstream
+      # tags are named "<version>rel" — not the plain version that appears in
+      # the download URL — and hardcoding the plain one here 404'd and failed
+      # the whole v0.1.1 release after the binaries had already built.
       - name: Fetch the helper's licence text
         shell: bash
         run: |
           set -euo pipefail
+          ver="$(sed -n 's/^HELPER_VERSION="\(.*\)"$/\1/p' fetch-helper.sh)"
+          test -n "$ver"
           curl -sSL --fail --max-time 120 \
             -o stage/windows/LICENSE-SumatraPDF.txt \
-            https://raw.githubusercontent.com/sumatrapdfreader/sumatrapdf/3.5.2/COPYING
+            "https://raw.githubusercontent.com/sumatrapdfreader/sumatrapdf/${ver}rel/COPYING"
           test -s stage/windows/LICENSE-SumatraPDF.txt
+          grep -q 'GNU GENERAL PUBLIC LICENSE' stage/windows/LICENSE-SumatraPDF.txt
 
       - name: Sign (Authenticode)
         if: ${{ env.CERT_PFX_BASE64 != '' }}
