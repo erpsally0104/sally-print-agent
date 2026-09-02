@@ -3,6 +3,10 @@
 A small service users install on their own machine so Sally can print to a
 **chosen printer** with no browser print dialog.
 
+Its own repository, separate from the `erp-sally` monorepo, because it ships as
+a signed downloadable binary on its own release cadence — the same arrangement
+as `sally-tally-connector`, whose release pipeline this one mirrors.
+
 It exists because no web API can enumerate printers. A page can call
 `window.print()` and nothing more — it cannot see the printer list, cannot
 choose a destination, and cannot suppress the dialog. Anything better has to
@@ -31,8 +35,18 @@ Sally (https://sallyerp.in)                    This agent (127.0.0.1:17777)
                                                     the printer
 ```
 
-The web-side client is [`apps/web/src/lib/print-agent.ts`](../web/src/lib/print-agent.ts);
-route selection lives in [`apps/web/src/lib/print-pdf.ts`](../web/src/lib/print-pdf.ts).
+The web-side half lives in the `erp-sally` monorepo, not here:
+
+| | |
+| --- | --- |
+| `apps/web/src/lib/print-agent.ts` | the client — detection, printer list, print |
+| `apps/web/src/lib/print-pdf.ts` | route selection: agent → hidden iframe → viewer tab |
+| `infra/sst.config.ts` | the S3 + CloudFront distribution this publishes to |
+
+**The two repositories share a protocol, so change it in lockstep.** Ports,
+header names, endpoint shapes and the `canPrint` flag are a contract. It is
+versioned (`/v1`) precisely so an old agent keeps working against a new Sally —
+when you break it, bump the prefix rather than redefining `/v1` in place.
 
 ## Security
 
@@ -85,7 +99,7 @@ than no dropdown at all.
 ## Distribution
 
 Binaries are published to the shared desktop-agent bucket and CloudFront
-distribution defined in `infra/sst.config.ts`, under the `/print-agent/`
+distribution defined in the monorepo's `infra/sst.config.ts`, under the `/print-agent/`
 prefix — the same infrastructure the Sally Tally Connector uses under `/tally/`.
 The stack outputs `PrintAgentWindowsUrl` and `PrintAgentMacUrl`; the web app
 receives them as env vars.

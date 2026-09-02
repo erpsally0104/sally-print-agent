@@ -1,0 +1,31 @@
+# Line endings are not cosmetic in this repo.
+#
+# It is developed on Windows but built for Windows and macOS, on CI runners of
+# both kinds. Two things break outright with CRLF:
+#
+#   * The shell scripts. A `build.sh` checked out with CRLF fails on macOS and
+#     Linux with a bare "bad interpreter" — the \r becomes part of the shebang.
+#   * gofmt. It treats a CRLF file as unformatted, so `gofmt -l .` fails CI on
+#     a Windows checkout even when nobody has touched the code.
+#
+# So everything text is normalised to LF in the repository AND in the working
+# tree, regardless of the developer's core.autocrlf setting.
+
+* text=auto eol=lf
+
+*.go    text eol=lf
+*.mod   text eol=lf
+*.sum   text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+
+# Anything we ship or fetch is bytes, not text.
+*.exe   binary
+*.pkg   binary
+*.dmg   binary
+*.zip   binary
+*.png   binary
+*.ico   binary

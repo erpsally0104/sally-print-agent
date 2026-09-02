@@ -1,0 +1,51 @@
+name: CI
+
+# Every push and PR: vet, test, check formatting, and prove all four shipped
+# targets still cross-compile from one runner. The cross-compile check is the
+# point of the no-cgo rule — if someone adds a cgo dependency (a tray icon
+# library is the likely temptation), this job is where it fails, not on the
+# release tag.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # These cover the security controls in security.go — the origin
+      # allowlist, the token, printer-name resolution and the rate limit — plus
+      # the request path in server.go. A failure here means the agent may be
+      # reachable by a site that is not Sally.
+      - name: Test
+        run: go test -race ./...
+
+      - name: Cross-compile every shipped target
+        run: |
+          set -euo pipefail
+          for target in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            echo "  $os/$arch"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -o /dev/null .
+          done

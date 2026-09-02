@@ -1,0 +1,322 @@
+name: Release
+
+# On a version tag: build both platforms, sign what we have certificates for,
+# then publish two ways —
+#   1. A GitHub Release (immutable build record + checksums).
+#   2. The Sally CloudFront downloads distribution under /print-agent/, which
+#      is the PUBLIC serving path the print dialog links and the updater polls.
+#
+# Mirrors the sally-tally-connector release workflow deliberately: same bucket,
+# same latest.json shape, same "gate on secrets so a bare tag still builds"
+# rule. Two agents that release the same way are two agents one person can
+# still operate.
+#
+# Repo secrets for the S3 publish (from the SST stack outputs):
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  — scoped CI user
+#   AWS_REGION                                 — e.g. ap-south-1
+#   DOWNLOADS_BUCKET                           — output TallyDownloadsBucket
+#                                                (one bucket serves both agents)
+#   DOWNLOADS_DISTRIBUTION_ID                  — output TallyDownloadsDistributionId
+# Optional: CERT_PFX / CERT_PASSWORD (Authenticode),
+#           MACOS_CERT_P12 / MACOS_CERT_PASSWORD / MACOS_SIGN_IDENTITY,
+#           APPLE_ID / APPLE_TEAM_ID / APPLE_APP_PASSWORD (notarisation),
+#           MIN_AGENT_VERSION (manifest floor).
+#
+# NOT YET BUILT: installers. This publishes zips, so a user extracts and runs
+# the agent by hand and it does NOT start at login. The .msi/.pkg steps are
+# marked TODO below; the stable aliases point at the zips until they exist,
+# rather than at installer URLs that would 404.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the GitHub Release
+
+jobs:
+  # ── Windows: agent + the PDF helper it cannot print without ───────────────
+  windows:
+    runs-on: windows-latest
+    env:
+      CERT_PFX_BASE64: ${{ secrets.CERT_PFX }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then ver="0.0.0-dev"; fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "version=$ver"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          mkdir -p stage/windows
+          for arch in amd64 arm64; do
+            GOOS=windows GOARCH="$arch" CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X main.version=$ver" \
+              -o "stage/windows/sally-print-agent-$arch.exe" .
+          done
+
+      # Windows cannot print a PDF to a named printer without this. The script
+      # pins the version and verifies SHA-256 of both the archive and the exe.
+      - name: Fetch the PDF print helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./fetch-helper.sh
+          cp dist/windows/SumatraPDF.exe stage/windows/SumatraPDF.exe
+          cp THIRD-PARTY-NOTICES.md stage/windows/THIRD-PARTY-NOTICES.md
+
+      # SumatraPDF is GPLv3 and we redistribute it, so its licence must travel
+      # with the binary. Fetched from the pinned tag, not from HEAD.
+      - name: Fetch the helper's licence text
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL --fail --max-time 120 \
+            -o stage/windows/LICENSE-SumatraPDF.txt \
+            https://raw.githubusercontent.com/sumatrapdfreader/sumatrapdf/3.5.2/COPYING
+          test -s stage/windows/LICENSE-SumatraPDF.txt
+
+      - name: Sign (Authenticode)
+        if: ${{ env.CERT_PFX_BASE64 != '' }}
+        shell: pwsh
+        env:
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+          TIMESTAMP_URL: ${{ vars.TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+          $ts = if ($env:TIMESTAMP_URL) { $env:TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found (Windows SDK missing on runner)' }
+          # Only our own binaries. SumatraPDF ships already signed by its
+          # authors; re-signing it would misattribute someone else's work.
+          Get-ChildItem stage\windows\sally-print-agent-*.exe | ForEach-Object {
+            & $signtool.FullName sign /fd SHA256 /tr $ts /td SHA256 /f $pfx /p $env:CERT_PASSWORD $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed on $($_.Name)" }
+            & $signtool.FullName verify /pa /v $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on $($_.Name)" }
+          }
+          Remove-Item $pfx -Force
+
+      - name: Signing skipped notice
+        if: ${{ env.CERT_PFX_BASE64 == '' }}
+        shell: bash
+        run: |
+          echo "::warning::CERT_PFX not set — shipping an UNSIGNED Windows build."
+          echo "Endpoint security flags unsigned processes that open a listening socket."
+
+      # TODO: build an .msi here that installs to Program Files and registers a
+      # Run key so the agent starts at login. Until then this zip is manual.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          mkdir -p out
+          (cd stage/windows && 7z a -tzip "../../out/sally-print-agent-$ver-windows.zip" .)
+          (cd out && sha256sum "sally-print-agent-$ver-windows.zip" > "sally-print-agent-$ver-windows.zip.sha256")
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  # ── macOS: CUPS takes PDF natively, so no helper is needed ────────────────
+  macos:
+    runs-on: macos-latest
+    env:
+      MACOS_CERT: ${{ secrets.MACOS_CERT_P12 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then ver="0.0.0-dev"; fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Build universal binary
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          mkdir -p stage/macos
+          for arch in amd64 arm64; do
+            GOOS=darwin GOARCH="$arch" CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X main.version=$ver" -o "build-$arch" .
+          done
+          # One download, both Mac architectures — the download page shouldn't
+          # have to ask which machine the visitor has.
+          lipo -create -output stage/macos/sally-print-agent build-amd64 build-arm64
+          lipo -info stage/macos/sally-print-agent
+
+      # Untested: we hold no Apple Developer ID yet. Without this, macOS
+      # refuses to launch the binary until the user overrides Gatekeeper.
+      - name: Sign and notarise
+        if: ${{ env.MACOS_CERT != '' }}
+        env:
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/build.keychain"
+          security create-keychain -p actions "$keychain"
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p actions "$keychain"
+          echo "$MACOS_CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions "$keychain"
+
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" stage/macos/sally-print-agent
+          codesign --verify --strict --verbose=2 stage/macos/sally-print-agent
+
+          # notarytool needs an archive, not a bare binary.
+          ditto -c -k --keepParent stage/macos/sally-print-agent "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          # A bare executable cannot be stapled; the .pkg will be, once it exists.
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Signing skipped notice
+        if: ${{ env.MACOS_CERT == '' }}
+        run: |
+          echo "::warning::MACOS_CERT_P12 not set — shipping an UNNOTARISED macOS build."
+          echo "macOS will refuse to launch it without the user overriding Gatekeeper."
+
+      # TODO: build a .pkg that installs to /usr/local/bin and drops a
+      # LaunchAgent plist with RunAtLoad + KeepAlive, then notarise + staple it.
+      - name: Package
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          cp THIRD-PARTY-NOTICES.md stage/macos/ 2>/dev/null || true
+          mkdir -p out
+          (cd stage/macos && zip -qr "../../out/sally-print-agent-$ver-macos.zip" .)
+          (cd out && shasum -a 256 "sally-print-agent-$ver-macos.zip" > "sally-print-agent-$ver-macos.zip.sha256")
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/*
+
+  # ── Publish: GitHub Release + the CloudFront downloads distribution ───────
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    env:
+      DOWNLOADS_BUCKET: ${{ secrets.DOWNLOADS_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+
+      - name: Collect
+        id: collect
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then ver="0.0.0-dev"; fi
+          mkdir -p out && find artifacts -type f -exec cp {} out/ \;
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          ls -la out
+
+      - name: Update manifest
+        run: |
+          set -euo pipefail
+          ver="${{ steps.collect.outputs.version }}"
+          min="${{ secrets.MIN_AGENT_VERSION }}"; min="${min:-0.0.0}"
+          win_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-windows.zip.sha256")"
+          mac_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-macos.zip.sha256")"
+          # URLs are ROOT-RELATIVE: the agent resolves them against the manifest
+          # URL it was handed, so no host is baked into a published artifact.
+          cat > out/latest.json <<JSON
+          {
+            "version": "$ver",
+            "minVersion": "$min",
+            "mandatory": false,
+            "releasedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows": { "url": "/print-agent/v$ver/sally-print-agent-$ver-windows.zip", "sha256": "$win_sha" },
+              "darwin":  { "url": "/print-agent/v$ver/sally-print-agent-$ver-macos.zip",  "sha256": "$mac_sha" }
+            }
+          }
+          JSON
+          cat out/latest.json
+
+      - name: Publish GitHub Release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Configure AWS credentials
+        if: ${{ env.DOWNLOADS_BUCKET != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Publish to S3 + invalidate CloudFront
+        if: ${{ env.DOWNLOADS_BUCKET != '' }}
+        env:
+          DISTRIBUTION_ID: ${{ secrets.DOWNLOADS_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+          ver="${{ steps.collect.outputs.version }}"
+          b="s3://$DOWNLOADS_BUCKET/print-agent"
+
+          # Versioned artefacts are immutable — cache them forever.
+          aws s3 cp "out/sally-print-agent-$ver-windows.zip" "$b/v$ver/" \
+            --content-type application/zip --cache-control "public,max-age=31536000,immutable"
+          aws s3 cp "out/sally-print-agent-$ver-macos.zip" "$b/v$ver/" \
+            --content-type application/zip --cache-control "public,max-age=31536000,immutable"
+
+          # Stable aliases the print dialog links. Short cache so a release is
+          # visible quickly; these are zips until the installers exist.
+          aws s3 cp "out/sally-print-agent-$ver-windows.zip" "$b/sally-print-agent-windows.zip" \
+            --content-type application/zip --cache-control "public,max-age=300"
+          aws s3 cp "out/sally-print-agent-$ver-macos.zip" "$b/sally-print-agent-macos.zip" \
+            --content-type application/zip --cache-control "public,max-age=300"
+
+          # The manifest must never be stale.
+          aws s3 cp out/latest.json "$b/latest.json" \
+            --content-type application/json --cache-control "no-cache"
+
+          if [ -n "${DISTRIBUTION_ID:-}" ]; then
+            aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
+              --paths "/print-agent/latest.json" \
+                      "/print-agent/sally-print-agent-windows.zip" \
+                      "/print-agent/sally-print-agent-macos.zip"
+          fi
+          echo "Published v$ver to $b/"
