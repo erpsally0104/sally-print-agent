@@ -1,0 +1,9 @@
+# Cross-compiled binaries — produced by build.sh, published by the release
+# pipeline, never committed.
+dist/
+
+# `go build` with no -o drops the binary in the package directory.
+sally-print-agent
+sally-print-agent.exe
+print-agent
+print-agent.exe
