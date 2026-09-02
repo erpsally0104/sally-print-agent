@@ -48,6 +48,44 @@ header names, endpoint shapes and the `canPrint` flag are a contract. It is
 versioned (`/v1`) precisely so an old agent keeps working against a new Sally —
 when you break it, bump the prefix rather than redefining `/v1` in place.
 
+## Installing
+
+The release ships a zip, not an installer yet, so setup is two steps: extract
+it somewhere permanent, then register it.
+
+```
+sally-print-agent -install     # start at login, and start now
+sally-print-agent -status      # is it registered? where?
+sally-print-agent -uninstall   # stop starting at login
+```
+
+Or use the **Start at login** card on the status page, which does the same
+thing and is what a user who unzipped the folder will actually find.
+
+Registration is per-user and needs no administrator rights:
+
+| | |
+| --- | --- |
+| Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
+| macOS | `~/Library/LaunchAgents/in.sallyerp.print-agent.plist` |
+
+A Windows *Service* would look like the right answer and is not: services run
+in session 0 with no user profile, where per-user printer connections are
+invisible. The agent has to run as the person whose printers it enumerates.
+The same reasoning rules out a machine-wide LaunchDaemon on macOS. launchd does
+give macOS one thing Windows lacks — `KeepAlive`, so a crashed agent restarts
+rather than staying dead until the next login.
+
+**Extract before installing.** Registration records an absolute path, so
+installing from `Downloads` and then moving the folder leaves the login item
+pointing at a binary that is gone. `-status` and the status page both detect
+that and say so, rather than letting you discover it at the next restart when
+printing has quietly reverted to the browser dialog.
+
+Since macOS Ventura the registration appears in System Settings → General →
+Login Items, where the user can switch it off. That is theirs to do; Sally just
+falls back to the browser print path.
+
 ## Security
 
 A service on loopback is unreachable from the network but reachable from
@@ -129,8 +167,19 @@ on that platform. `http://127.0.0.1:17777/` shows status, the printer list, the
 token and a Quit button, and is refused to web pages.
 
 ```bash
-go test ./...   # security controls and the request path
+go test ./...   # security controls, the request path, autostart comparison
 go vet ./...
+```
+
+Registering at login is not unit-tested: it writes to the real registry or the
+real `LaunchAgents` directory, and a test that mutates the developer's login
+items is worse than no test. Verify it by hand instead:
+
+```
+sally-print-agent -install     # then check the Run key / plist exists
+sally-print-agent -status      # should report yes, with this binary's path
+cp agent.exe elsewhere/        # run the copy: -status should flag the mismatch
+sally-print-agent -uninstall   # then check the key / plist is gone
 ```
 
 ## Not done yet
@@ -152,6 +201,9 @@ this can go on the website:
 - **A "Direct printing is off" hint** in the print dialog, linking to the
   installer. The URLs are already wired through as
   `NEXT_PUBLIC_PRINT_AGENT_WINDOWS_URL` / `..._MAC_URL`.
+- **Installers** (`.msi` / `.pkg`). Start-at-login itself is done — the
+  installer's remaining job is putting the files somewhere permanent and
+  calling `-install`, rather than reimplementing it in a packaging script.
 - **A real print on paper.** Everything up to the spooler is verified —
   enumeration, refusals, `canPrint` flipping true with the helper present — but
   no sheet has actually come out of a printer yet.

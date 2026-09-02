@@ -41,14 +41,46 @@ var candidatePorts = []int{17777, 17778, 17779, 17780}
 
 func main() {
 	var (
-		portFlag = flag.Int("port", 0, "bind to this port instead of the default range")
-		showVer  = flag.Bool("version", false, "print the version and exit")
+		portFlag  = flag.Int("port", 0, "bind to this port instead of the default range")
+		showVer   = flag.Bool("version", false, "print the version and exit")
+		install   = flag.Bool("install", false, "start the agent automatically at login, then run")
+		uninstall = flag.Bool("uninstall", false, "stop starting at login, then exit")
+		status    = flag.Bool("status", false, "report whether the agent starts at login, then exit")
 	)
 	flag.Parse()
 
 	if *showVer {
 		fmt.Printf("sally-print-agent %s\n", version)
 		return
+	}
+
+	// The autostart flags run before anything binds a port: they are
+	// administrative, and -uninstall in particular has to work while another
+	// copy of the agent is already running and holding that port.
+	if *status {
+		if err := reportAutostart(); err != nil {
+			fmt.Fprintf(os.Stderr, "sally-print-agent: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *uninstall {
+		if err := disableAutostart(); err != nil {
+			fmt.Fprintf(os.Stderr, "sally-print-agent: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("The agent will no longer start at login.")
+		fmt.Println("Any running copy keeps going until you quit it.")
+		return
+	}
+	if *install {
+		if err := enableAutostart(); err != nil {
+			fmt.Fprintf(os.Stderr, "sally-print-agent: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("The agent will start automatically at login (%s).\n", autostartLocation())
+		// Deliberately falls through into serving: someone who has just run
+		// -install wants printing working now, not after the next reboot.
 	}
 
 	cfg, configPath, err := loadOrCreateConfig()
@@ -126,6 +158,36 @@ func main() {
 		logger.Printf("shutdown was not clean: %v", err)
 	}
 	logger.Printf("stopped")
+}
+
+// reportAutostart prints the registration state for -status, including the
+// "you moved the binary" case. That one is otherwise invisible until the
+// machine is next restarted and printing has quietly stopped working.
+func reportAutostart() error {
+	state, err := autostartState()
+	if err != nil {
+		return err
+	}
+	if !state.Supported {
+		fmt.Println("Start at login: not supported on this platform.")
+		return nil
+	}
+	if !state.Enabled {
+		fmt.Println("Start at login: no.")
+		fmt.Println("Enable it with:  sally-print-agent -install")
+		return nil
+	}
+	fmt.Printf("Start at login: yes (%s)\n", state.Location)
+	fmt.Printf("  registered:   %s\n", state.RegisteredPath)
+
+	exe, err := currentExecutable()
+	if err == nil && state.Stale(exe) {
+		fmt.Printf("  running:      %s\n", exe)
+		fmt.Println()
+		fmt.Println("These differ: the agent has moved since it was registered, so the copy")
+		fmt.Println("that starts at login is not this one. Re-run -install from here.")
+	}
+	return nil
 }
 
 // listenLoopback binds the first free candidate port.

@@ -67,6 +67,7 @@ func (s *server) routes() *http.ServeMux {
 	// The status page and its Quit button: local only, never a web page.
 	mux.HandleFunc("/", s.handleStatusPage)
 	mux.HandleFunc("/quit", s.requireLocalPage(s.handleQuit))
+	mux.HandleFunc("/autostart", s.requireLocalPage(s.handleAutostart))
 
 	// The API Sally talks to. Every one of these is behind the origin
 	// allowlist; the last two additionally require the token.
@@ -206,6 +207,36 @@ func (s *server) handlePrint(w http.ResponseWriter, r *http.Request) {
 		"printer": printer,
 		"copies":  copies,
 	})
+}
+
+// handleAutostart turns "start at login" on or off from the status page.
+//
+// Behind requireLocalPage for the same reason /quit is: a web page must not
+// be able to register a background process on the viewer's machine, and an
+// allowlisted origin is still a web page. Only the agent's own status page
+// reaches this.
+func (s *server) handleAutostart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	enable := r.URL.Query().Get("enable") == "true"
+
+	var err error
+	if enable {
+		err = enableAutostart()
+	} else {
+		err = disableAutostart()
+	}
+	if err != nil {
+		s.logf("autostart change failed: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	state, _ := autostartState()
+	s.logf("start at login set to %v", state.Enabled)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": state.Enabled})
 }
 
 func (s *server) handleQuit(w http.ResponseWriter, r *http.Request) {

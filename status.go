@@ -21,19 +21,22 @@ reached from elsewhere.
 */
 
 type statusView struct {
-	Version    string
-	Port       int
-	Origin     string
-	MachineID  string
-	Token      string
-	ConfigPath string
-	LogPath    string
-	Platform   string
-	Printers   []Printer
-	CanPrint   bool
-	PrinterErr string
-	CopiesNote string
-	Origins    []string
+	Version        string
+	Port           int
+	Origin         string
+	MachineID      string
+	Token          string
+	ConfigPath     string
+	LogPath        string
+	Platform       string
+	Printers       []Printer
+	CanPrint       bool
+	Autostart      AutostartState
+	AutostartStale bool
+	CurrentExe     string
+	PrinterErr     string
+	CopiesNote     string
+	Origins        []string
 }
 
 func (s *server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +63,13 @@ func (s *server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
 		CanPrint:   s.canPrint(),
 		CopiesNote: copiesNote(),
 		Origins:    s.cfg.AllowedOrigins,
+	}
+	if auto, err := autostartState(); err == nil {
+		view.Autostart = auto
+		if exe, exeErr := currentExecutable(); exeErr == nil {
+			view.CurrentExe = exe
+			view.AutostartStale = auto.Stale(exe)
+		}
 	}
 	if list, err := s.printers(); err != nil {
 		view.PrinterErr = err.Error()
@@ -149,12 +159,62 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Start at login</h2>
+    {{if .Autostart.Supported}}
+      {{if .Autostart.Enabled}}
+        <p><span class="ok">On</span> &mdash; the agent starts automatically when you sign in.</p>
+        {{if .AutostartStale}}
+          <p class="warn">But it is registered at a different location, so the copy that
+          starts at login is not this one:</p>
+          <dl>
+            <dt>registered</dt><dd><code>{{.Autostart.RegisteredPath}}</code></dd>
+            <dt>running</dt><dd><code>{{.CurrentExe}}</code></dd>
+          </dl>
+          <p class="note">Turn it off and on again here to register this copy.</p>
+        {{end}}
+        <button id="autostart" data-enable="false" type="button">Turn off</button>
+      {{else}}
+        <p><span class="warn">Off</span> &mdash; you will have to start the agent yourself
+        after each restart, and printing falls back to your browser&rsquo;s print dialog
+        until you do.</p>
+        <button id="autostart" data-enable="true" type="button">Turn on</button>
+      {{end}}
+      <p class="note">Registered at <code>{{.Autostart.Location}}</code> for your user
+      account only. No administrator rights needed, and nothing is installed
+      machine-wide.</p>
+    {{else}}
+      <p class="note">Not supported on this platform.</p>
+    {{end}}
+  </div>
+
+  <div class="card">
     <h2>Stop the agent</h2>
     <button id="quit" type="button">Quit</button>
     <p class="note">Printing falls back to your browser&rsquo;s print dialog until you start it again. It restarts at your next login.</p>
   </div>
 </div>
 <script>
+  var auto = document.getElementById('autostart');
+  if (auto) {
+    auto.addEventListener('click', async function () {
+      this.disabled = true;
+      var enable = this.dataset.enable;
+      try {
+        var res = await fetch('/autostart?enable=' + enable, {
+          method: 'POST', headers: { 'X-Sally-Local': '1' },
+        });
+        if (!res.ok) {
+          var body = await res.json().catch(function () { return {}; });
+          throw new Error(body.error || 'could not change the setting');
+        }
+        location.reload();
+      } catch (e) {
+        this.disabled = false;
+        this.textContent = 'Failed \u2014 ' + e.message;
+      }
+    });
+  }
+
   document.getElementById('quit').addEventListener('click', async function () {
     this.disabled = true;
     this.textContent = 'Stopping…';

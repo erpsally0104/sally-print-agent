@@ -298,6 +298,36 @@ func TestQuitIsNotReachableFromAWebPage(t *testing.T) {
 	})
 }
 
+func TestAutostartCannotBeChangedByAWebPage(t *testing.T) {
+	s, _ := newTestServer(t, nil, nil)
+
+	// Registering a background process that launches at login is exactly the
+	// kind of thing a hostile page would want. requireLocalPage refuses before
+	// the handler runs, so nothing touches the registry or LaunchAgents here.
+	for _, origin := range []string{"https://sallyerp.in", "https://evil.example"} {
+		t.Run(origin, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/autostart?enable=true", nil)
+			req.Header.Set("Origin", origin)
+			req.Header.Set(localHeader, "1")
+			rec := httptest.NewRecorder()
+			s.routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status %d, want 403 - a web page must not register a login item", rec.Code)
+			}
+		})
+	}
+
+	t.Run("and not without the local marker either", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/autostart?enable=true", nil)
+		rec := httptest.NewRecorder()
+		s.routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status %d, want 403", rec.Code)
+		}
+	})
+}
+
 func TestPrinterListIsCached(t *testing.T) {
 	s, _ := newTestServer(t, nil, nil)
 	calls := 0
