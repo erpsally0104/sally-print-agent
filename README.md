@@ -182,6 +182,69 @@ cp agent.exe elsewhere/        # run the copy: -status should flag the mismatch
 sally-print-agent -uninstall   # then check the key / plist is gone
 ```
 
+## Release secrets
+
+Set these on the repository (Settings → Secrets and variables → Actions).
+Values come from the SST stack outputs — `npx sst outputs --stage production`
+in the monorepo, or the tail of a deploy log.
+
+| Secret | Value |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Scoped CI user — policy below |
+| `AWS_REGION` | `ap-south-1` |
+| `DOWNLOADS_BUCKET` | SST output `TallyDownloadsBucket` (one bucket serves both agents) |
+| `DOWNLOADS_DISTRIBUTION_ID` | SST output `TallyDownloadsDistributionId` |
+| `CERT_PFX` / `CERT_PASSWORD` *(optional)* | base64 of the Authenticode `.pfx`, and its password |
+| `MACOS_CERT_P12` / `MACOS_CERT_PASSWORD` / `MACOS_SIGN_IDENTITY` *(optional)* | Developer ID signing |
+| `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_PASSWORD` *(optional)* | notarisation |
+| `MIN_AGENT_VERSION` *(optional)* | forced-update floor written into `latest.json` |
+| `TIMESTAMP_URL` *(optional **variable**, not a secret)* | Authenticode timestamp server override |
+
+Every optional one is gated in the workflow, so a bare tag still builds:
+without the AWS secrets the S3 publish is skipped, and without the certificates
+the build ships **unsigned** with a warning.
+
+### This repo needs its OWN AWS user
+
+Do **not** reuse the Tally connector's keys. Its policy is scoped to
+`sally-tally-downloads-production/tally/*`, so uploads to `/print-agent/*`
+would be denied — and sharing one key would let either agent's CI overwrite the
+other's published installer.
+
+SST's deploy role cannot create IAM users, so make one by hand:
+
+```bash
+aws iam create-user --user-name sally-print-agent-ci
+aws iam put-user-policy --user-name sally-print-agent-ci \
+  --policy-name publish-print-agent --policy-document file://ci-policy.json
+aws iam create-access-key --user-name sally-print-agent-ci
+```
+
+`ci-policy.json`, with this account's real values already filled in:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "PublishBinaries", "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::sally-tally-downloads-production/print-agent/*" },
+    { "Sid": "ListForSync", "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::sally-tally-downloads-production" },
+    { "Sid": "InvalidateCdn", "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation"],
+      "Resource": "arn:aws:cloudfront::095453158319:distribution/E7WTFB0QOX8J4" }
+  ]
+}
+```
+
+The `print-agent/*` prefix is the whole point: this user can publish the print
+agent and nothing else in the bucket.
+
+(Hardening upgrade, same as the connector's: swap the static user for a GitHub
+OIDC role once an OIDC provider exists in the account.)
+
 ## Not done yet
 
 The binaries build and run; **packaging and distribution do not exist**. Before
