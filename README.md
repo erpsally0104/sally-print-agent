@@ -211,7 +211,8 @@ Do **not** reuse the Tally connector's keys. Its policy is scoped to
 would be denied — and sharing one key would let either agent's CI overwrite the
 other's published installer.
 
-SST's deploy role cannot create IAM users, so make one by hand:
+The `sally-deployer` user carries AdministratorAccess, so it can create this
+user directly (the Tally connector's README says otherwise; that is stale):
 
 ```bash
 aws iam create-user --user-name sally-print-agent-ci
