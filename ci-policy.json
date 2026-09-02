@@ -1,0 +1,14 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "PublishBinaries", "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::sally-tally-downloads-production/print-agent/*" },
+    { "Sid": "ListForSync", "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::sally-tally-downloads-production" },
+    { "Sid": "InvalidateCdn", "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation"],
+      "Resource": "arn:aws:cloudfront::095453158319:distribution/E7WTFB0QOX8J4" }
+  ]
+}
