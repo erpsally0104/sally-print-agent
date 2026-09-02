@@ -288,8 +288,15 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
 
+      # Both of the steps below are tag-gated as well as secret-gated, and the
+      # tag half is not optional. workflow_dispatch resolves the version to
+      # 0.0.0-dev, and without `ref_type == 'tag'` a manual run would leave the
+      # GitHub Release alone but still overwrite latest.json and the stable
+      # aliases on the PRODUCTION distribution with that dev build — and
+      # latest.json is served no-cache, so every installed agent would see it
+      # within seconds.
       - name: Configure AWS credentials
-        if: ${{ env.DOWNLOADS_BUCKET != '' }}
+        if: ${{ github.ref_type == 'tag' && env.DOWNLOADS_BUCKET != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -297,7 +304,7 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Publish to S3 + invalidate CloudFront
-        if: ${{ env.DOWNLOADS_BUCKET != '' }}
+        if: ${{ github.ref_type == 'tag' && env.DOWNLOADS_BUCKET != '' }}
         env:
           DISTRIBUTION_ID: ${{ secrets.DOWNLOADS_DISTRIBUTION_ID }}
         run: |
