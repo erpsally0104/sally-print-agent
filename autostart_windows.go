@@ -152,3 +152,8 @@ func disableAutostart() error {
 	}
 	return nil
 }
+
+// autostartLaunchesIt reports whether enableAutostart also started the agent.
+// Writing a Run key does not: Windows reads it at the next login and no
+// sooner, so -install has to go on and serve the current session itself.
+func autostartLaunchesIt() bool { return false }

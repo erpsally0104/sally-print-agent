@@ -334,8 +334,78 @@ jobs:
           echo "::warning::MACOS_CERT_P12 not set — shipping an UNNOTARISED macOS build."
           echo "macOS will refuse to launch it without the user overriding Gatekeeper."
 
-      # TODO: build a .pkg that installs to /usr/local/bin and drops a
-      # LaunchAgent plist with RunAtLoad + KeepAlive, then notarise + staple it.
+      # ── Installer ─────────────────────────────────────────────────────────
+      # The payload is just the binary in /usr/local/bin. The LaunchAgent is
+      # NOT part of it: the plist belongs to ~/Library/LaunchAgents, which is
+      # per-user and unknown at build time, so postinstall calls the agent's
+      # own -install as the console user instead of the package shipping a
+      # plist it would have to keep in step with autostart_darwin.go.
+      - name: Build the pkg
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          pkgver="${ver%%-*}"
+
+          mkdir -p payload/usr/local/bin
+          cp stage/macos/sally-print-agent payload/usr/local/bin/sally-print-agent
+          chmod 755 payload/usr/local/bin/sally-print-agent
+
+          # Git does not preserve the executable bit on every checkout path,
+          # and pkgbuild silently ships a non-executable script as one that
+          # never runs.
+          chmod 755 packaging/macos/scripts/preinstall packaging/macos/scripts/postinstall
+
+          mkdir -p out build
+          pkgbuild \
+            --root payload \
+            --scripts packaging/macos/scripts \
+            --identifier in.sallyerp.print-agent \
+            --version "$pkgver" \
+            --install-location / \
+            build/component.pkg
+
+          # productbuild wraps the component in a distribution archive, which
+          # is the form productsign and notarisation both expect.
+          productbuild \
+            --package build/component.pkg \
+            "out/sally-print-agent-$ver-macos.pkg"
+
+          pkgutil --payload-files "out/sally-print-agent-$ver-macos.pkg"
+
+      # Gatekeeper judges the package the user double-clicks, so it needs its
+      # own signature from a Developer ID *Installer* certificate — a different
+      # certificate from the Developer ID Application one that signed the
+      # binary, and not interchangeable with it.
+      - name: Sign and notarise the pkg
+        if: ${{ env.MACOS_CERT != '' }}
+        env:
+          MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          pkg="out/sally-print-agent-$ver-macos.pkg"
+
+          if [ -z "${MACOS_INSTALLER_IDENTITY:-}" ]; then
+            echo "::warning::MACOS_INSTALLER_IDENTITY not set — pkg is UNSIGNED."
+            echo "Gatekeeper will refuse to open it."
+            exit 0
+          fi
+
+          productsign --sign "$MACOS_INSTALLER_IDENTITY" "$pkg" "$pkg.signed"
+          mv "$pkg.signed" "$pkg"
+          pkgutil --check-signature "$pkg"
+
+          xcrun notarytool submit "$pkg" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          # Unlike a bare executable, a pkg can be stapled — so it installs on
+          # a machine that is offline or cannot reach Apple.
+          xcrun stapler staple "$pkg"
+          xcrun stapler validate "$pkg"
+
       - name: Package
         run: |
           set -euo pipefail
@@ -343,7 +413,7 @@ jobs:
           cp THIRD-PARTY-NOTICES.md stage/macos/ 2>/dev/null || true
           mkdir -p out
           (cd stage/macos && zip -qr "../../out/sally-print-agent-$ver-macos.zip" .)
-          (cd out && shasum -a 256 "sally-print-agent-$ver-macos.zip" > "sally-print-agent-$ver-macos.zip.sha256")
+          (cd out && for f in *.zip *.pkg; do shasum -a 256 "$f" > "$f.sha256"; done)
           ls -la out
 
       - uses: actions/upload-artifact@v4

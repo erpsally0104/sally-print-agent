@@ -1,0 +1,34 @@
+#!/bin/sh
+#
+# Stop and deregister any agent already running, before its binary is replaced.
+#
+# Upgrading underneath a running launchd job leaves the old process alive,
+# holding port 17777, while the new one starts on 17778 — Sally's probe then
+# finds two agents and the user has no way to tell which is which. -uninstall
+# boots the job out and removes the plist; postinstall registers it again
+# against the new binary.
+#
+# Everything here is best-effort: a first-time install has nothing to stop.
+
+set -eu
+
+AGENT=/usr/local/bin/sally-print-agent
+
+[ -x "$AGENT" ] || exit 0
+
+console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo '')
+if [ -z "$console_user" ] || [ "$console_user" = "root" ]; then
+    exit 0
+fi
+
+uid=$(/usr/bin/id -u "$console_user" 2>/dev/null || echo '')
+[ -n "$uid" ] || exit 0
+
+/bin/launchctl asuser "$uid" /usr/bin/sudo -u "$console_user" "$AGENT" -uninstall || true
+
+# -uninstall deliberately leaves a running copy alone, since it is also how a
+# user turns autostart off without interrupting a print. An upgrade does need
+# it gone, or the replaced binary keeps serving until the next login.
+/usr/bin/pkill -u "$uid" -x sally-print-agent 2>/dev/null || true
+
+exit 0

@@ -1,0 +1,43 @@
+#!/bin/sh
+#
+# Register the agent to start at login, once its files are in place.
+#
+# The installer runs as root, but everything about this registration is
+# per-user: the plist lives in ~/Library/LaunchAgents and the job belongs to
+# the gui/<uid> launchd domain. Registering as root would write root's plist,
+# in root's domain, for a user who has no GUI session — and the person who
+# double-clicked the package would get nothing, with no error to show for it.
+#
+# So drop to the console user deliberately. `launchctl asuser` puts us in that
+# user's bootstrap context, which is what `launchctl bootstrap gui/<uid>`
+# inside the agent needs to succeed.
+#
+# Failing to register is not worth failing the install over: the binary is
+# installed and working, and the status page offers "Start at login" as a
+# one-click alternative. Exit 0 and let the user do it by hand.
+
+set -eu
+
+AGENT=/usr/local/bin/sally-print-agent
+
+console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo '')
+
+# At the login window /dev/console is owned by root, and a package installed
+# there has no user to register for.
+if [ -z "$console_user" ] || [ "$console_user" = "root" ]; then
+    echo "no console user; skipping start-at-login registration"
+    exit 0
+fi
+
+uid=$(/usr/bin/id -u "$console_user" 2>/dev/null || echo '')
+if [ -z "$uid" ]; then
+    echo "could not resolve uid for $console_user; skipping registration"
+    exit 0
+fi
+
+echo "registering start-at-login for $console_user (uid $uid)"
+if ! /bin/launchctl asuser "$uid" /usr/bin/sudo -u "$console_user" "$AGENT" -install; then
+    echo "could not register automatically; the status page can do it instead"
+fi
+
+exit 0

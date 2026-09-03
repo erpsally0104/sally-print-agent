@@ -157,3 +157,10 @@ func runLaunchctl(args ...string) error {
 	}
 	return nil
 }
+
+// autostartLaunchesIt reports whether enableAutostart also started the agent.
+// It did: `launchctl bootstrap` starts the job immediately, so by the time
+// enableAutostart returns there is already an agent serving. -install must not
+// then serve as well, or the second copy takes the next port in the range and
+// Sally's probe finds two agents where the user installed one.
+func autostartLaunchesIt() bool { return true }

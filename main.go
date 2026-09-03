@@ -79,8 +79,18 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("The agent will start automatically at login (%s).\n", autostartLocation())
-		// Deliberately falls through into serving: someone who has just run
-		// -install wants printing working now, not after the next reboot.
+
+		// Where registering also starts the agent — launchd bootstraps the job
+		// the moment the plist is loaded — serving here as well would leave two
+		// copies running, the second on the next port in the range, and Sally's
+		// probe would find two agents where the user installed one.
+		if autostartLaunchesIt() {
+			fmt.Println("It is running now, started by the system.")
+			return
+		}
+		// Otherwise fall through into serving: a Run key is not read until the
+		// next login, and someone who has just run -install wants printing
+		// working now, not after the next reboot.
 	}
 
 	cfg, configPath, err := loadOrCreateConfig()

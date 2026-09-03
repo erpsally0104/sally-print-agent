@@ -21,3 +21,6 @@ func autostartState() (AutostartState, error) {
 
 func enableAutostart() error  { return errAutostartUnsupported }
 func disableAutostart() error { return errAutostartUnsupported }
+
+// enableAutostart never succeeds here, so nothing is ever launched by it.
+func autostartLaunchesIt() bool { return false }
