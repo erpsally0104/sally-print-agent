@@ -111,25 +111,27 @@
          Impersonate="yes" throughout: every one of these has to run as the
          installing user, because HKCU is the whole point. -->
 
-    <!-- An agent from a previous version is holding sally-print-agent.exe
-         open, and MSI cannot replace or delete a running binary. Go programs
-         do not register with the Restart Manager, so MSI has no way to ask
-         politely. Returns 128 when nothing is running, hence Return="ignore". -->
-    <SetProperty Id="StopRunningAgent"
-                 Value="&quot;[System64Folder]taskkill.exe&quot; /IM sally-print-agent.exe /F"
-                 Before="StopRunningAgent"
-                 Sequence="execute" />
+    <!-- These are all built-in custom action types on purpose. The obvious
+         alternative, WixQuietExec from WixToolset.Util.wixext, would pull in an
+         extension whose CA binary is named for the toolset major version, and
+         pinning the toolset (see the workflow) would then have to keep that
+         name in step for no benefit here. -->
+
+    <!-- An agent from a previous version is holding sally-print-agent.exe open,
+         and MSI cannot replace or delete a running binary. Go programs do not
+         register with the Restart Manager, so MSI has no way to ask politely.
+         taskkill exits 128 when nothing matched, hence Return="ignore". -->
     <CustomAction Id="StopRunningAgent"
-                  DllEntry="WixQuietExec64"
-                  BinaryRef="Wix4UtilCA_X64"
-                  Execute="deferred"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="[System64Folder]taskkill.exe /IM sally-print-agent.exe /F"
+                  Execute="immediate"
                   Impersonate="yes"
                   Return="ignore" />
 
     <!-- -install registers autostart and then deliberately falls through into
          serving, so the agent is printing before the installer's progress bar
-         has finished. That means it never returns: asyncNoWait is required,
-         not an optimisation. -->
+         has finished. That means it never returns: asyncNoWait is required
+         here, not an optimisation. -->
     <CustomAction Id="RegisterAutostart"
                   FileRef="AgentExeFile"
                   ExeCommand="-install"
@@ -138,22 +140,19 @@
                   Return="asyncNoWait" />
 
     <!-- Leaving the Run key behind would point at a deleted executable, and
-         Windows would fail silently at every login from then on. -->
-    <SetProperty Id="UnregisterAutostart"
-                 Value="&quot;[INSTALLFOLDER]sally-print-agent.exe&quot; -uninstall"
-                 Before="UnregisterAutostart"
-                 Sequence="execute" />
+         Windows would fail silently at every login from then on. Runs before
+         RemoveFiles, while the exe it invokes still exists. -->
     <CustomAction Id="UnregisterAutostart"
-                  DllEntry="WixQuietExec64"
-                  BinaryRef="Wix4UtilCA_X64"
-                  Execute="deferred"
+                  FileRef="AgentExeFile"
+                  ExeCommand="-uninstall"
+                  Execute="immediate"
                   Impersonate="yes"
                   Return="ignore" />
 
     <InstallExecuteSequence>
       <Custom Action="UnregisterAutostart" Before="StopRunningAgent" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="StopRunningAgent" Before="RemoveFiles" />
-      <Custom Action="RegisterAutostart" After="InstallFinalize" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RegisterAutostart" After="InstallFinalize" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

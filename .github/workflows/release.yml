@@ -135,14 +135,17 @@ jobs:
       # agent renamed to a fixed sally-print-agent.exe, because the installed
       # filename must not carry an architecture the Run key would then have to
       # know about.
+      # Pinned to v5 deliberately. From v6 the toolset requires accepting the
+      # Open Source Maintenance Fee EULA, which is a paid licence for
+      # commercial use — an unpinned install fails outright with WIX7015.
+      # v5 is the last release without that obligation and speaks the same
+      # v4 schema this .wxs is written against.
       - name: Install WiX
         shell: bash
         run: |
           set -euo pipefail
-          dotnet tool install --global wix
+          dotnet tool install --global wix --version '5.*'
           "$USERPROFILE/.dotnet/tools/wix.exe" --version
-          # WixQuietExec64, used to run the agent's -uninstall on removal.
-          "$USERPROFILE/.dotnet/tools/wix.exe" extension add --global WixToolset.Util.wixext
 
       - name: Build the MSIs
         shell: bash
@@ -175,7 +178,6 @@ jobs:
               -arch "$wixarch" \
               -d "Version=$msiver" \
               -d "Stage=$(pwd -W)/$s" \
-              -ext WixToolset.Util.wixext \
               -o "out/sally-print-agent-$ver-windows-$wixarch.msi"
           done
           ls -la out
