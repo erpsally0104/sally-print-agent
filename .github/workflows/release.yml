@@ -447,8 +447,15 @@ jobs:
           set -euo pipefail
           ver="${{ steps.collect.outputs.version }}"
           min="${{ secrets.MIN_AGENT_VERSION }}"; min="${min:-0.0.0}"
-          win_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-windows.zip.sha256")"
-          mac_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-macos.zip.sha256")"
+          # `url` is what a person should download, so it names the installer
+          # now that one exists. `zipUrl` keeps the extract-and-run build
+          # addressable for anyone who cannot run an installer — and for the
+          # updater, which has to replace a binary without a UAC prompt.
+          win_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-windows-x64.msi.sha256")"
+          mac_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-macos.pkg.sha256")"
+          win_arm_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-windows-arm64.msi.sha256")"
+          win_zip_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-windows.zip.sha256")"
+          mac_zip_sha="$(cut -d' ' -f1 < "out/sally-print-agent-$ver-macos.zip.sha256")"
           # URLs are ROOT-RELATIVE: the agent resolves them against the manifest
           # URL it was handed, so no host is baked into a published artifact.
           cat > out/latest.json <<JSON
@@ -458,8 +465,17 @@ jobs:
             "mandatory": false,
             "releasedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
-              "windows": { "url": "/print-agent/v$ver/sally-print-agent-$ver-windows.zip", "sha256": "$win_sha" },
-              "darwin":  { "url": "/print-agent/v$ver/sally-print-agent-$ver-macos.zip",  "sha256": "$mac_sha" }
+              "windows": {
+                "url": "/print-agent/v$ver/sally-print-agent-$ver-windows-x64.msi", "sha256": "$win_sha",
+                "zipUrl": "/print-agent/v$ver/sally-print-agent-$ver-windows.zip", "zipSha256": "$win_zip_sha"
+              },
+              "windows-arm64": {
+                "url": "/print-agent/v$ver/sally-print-agent-$ver-windows-arm64.msi", "sha256": "$win_arm_sha"
+              },
+              "darwin": {
+                "url": "/print-agent/v$ver/sally-print-agent-$ver-macos.pkg", "sha256": "$mac_sha",
+                "zipUrl": "/print-agent/v$ver/sally-print-agent-$ver-macos.zip", "zipSha256": "$mac_zip_sha"
+              }
             }
           }
           JSON
@@ -497,14 +513,31 @@ jobs:
           ver="${{ steps.collect.outputs.version }}"
           b="s3://$DOWNLOADS_BUCKET/print-agent"
 
+          immutable="public,max-age=31536000,immutable"
+          msi_type="application/x-msi"
+          pkg_type="application/vnd.apple.installer+xml"
+
           # Versioned artefacts are immutable — cache them forever.
           aws s3 cp "out/sally-print-agent-$ver-windows.zip" "$b/v$ver/" \
-            --content-type application/zip --cache-control "public,max-age=31536000,immutable"
+            --content-type application/zip --cache-control "$immutable"
           aws s3 cp "out/sally-print-agent-$ver-macos.zip" "$b/v$ver/" \
-            --content-type application/zip --cache-control "public,max-age=31536000,immutable"
+            --content-type application/zip --cache-control "$immutable"
+          aws s3 cp "out/sally-print-agent-$ver-windows-x64.msi" "$b/v$ver/" \
+            --content-type "$msi_type" --cache-control "$immutable"
+          aws s3 cp "out/sally-print-agent-$ver-windows-arm64.msi" "$b/v$ver/" \
+            --content-type "$msi_type" --cache-control "$immutable"
+          aws s3 cp "out/sally-print-agent-$ver-macos.pkg" "$b/v$ver/" \
+            --content-type "$pkg_type" --cache-control "$immutable"
 
           # Stable aliases the print dialog links. Short cache so a release is
-          # visible quickly; these are zips until the installers exist.
+          # visible quickly. These now point at the installers; the zips keep
+          # their own aliases for anyone who would rather not run one.
+          aws s3 cp "out/sally-print-agent-$ver-windows-x64.msi" "$b/sally-print-agent-windows.msi" \
+            --content-type "$msi_type" --cache-control "public,max-age=300"
+          aws s3 cp "out/sally-print-agent-$ver-windows-arm64.msi" "$b/sally-print-agent-windows-arm64.msi" \
+            --content-type "$msi_type" --cache-control "public,max-age=300"
+          aws s3 cp "out/sally-print-agent-$ver-macos.pkg" "$b/sally-print-agent-macos.pkg" \
+            --content-type "$pkg_type" --cache-control "public,max-age=300"
           aws s3 cp "out/sally-print-agent-$ver-windows.zip" "$b/sally-print-agent-windows.zip" \
             --content-type application/zip --cache-control "public,max-age=300"
           aws s3 cp "out/sally-print-agent-$ver-macos.zip" "$b/sally-print-agent-macos.zip" \
@@ -514,9 +547,15 @@ jobs:
           aws s3 cp out/latest.json "$b/latest.json" \
             --content-type application/json --cache-control "no-cache"
 
+          # Only the stable aliases need invalidating. The versioned paths are
+          # new on every release, so nothing is cached under them yet — and
+          # naming them here would spend invalidations for no effect.
           if [ -n "${DISTRIBUTION_ID:-}" ]; then
             aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
               --paths "/print-agent/latest.json" \
+                      "/print-agent/sally-print-agent-windows.msi" \
+                      "/print-agent/sally-print-agent-windows-arm64.msi" \
+                      "/print-agent/sally-print-agent-macos.pkg" \
                       "/print-agent/sally-print-agent-windows.zip" \
                       "/print-agent/sally-print-agent-macos.zip"
           fi
