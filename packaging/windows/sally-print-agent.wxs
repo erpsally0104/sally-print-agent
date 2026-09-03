@@ -50,6 +50,9 @@
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPURLINFOABOUT" Value="https://sallyerp.in" />
     <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- Without this, Apps &amp; Features shows the entry with a blank size and
+         location. INSTALLFOLDER is not resolved until CostFinalize. -->
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
 
     <!-- %LOCALAPPDATA%\Programs is where per-user apps belong; it is what
          Windows itself uses for per-user installs and needs no elevation. -->

@@ -17,15 +17,19 @@ name: Release
 #   DOWNLOADS_BUCKET                           — output TallyDownloadsBucket
 #                                                (one bucket serves both agents)
 #   DOWNLOADS_DISTRIBUTION_ID                  — output TallyDownloadsDistributionId
-# Optional: CERT_PFX / CERT_PASSWORD (Authenticode),
+# Optional: ES_USERNAME / ES_PASSWORD / ES_CREDENTIAL_ID / ES_TOTP_SECRET
+#             (Authenticode, via SSL.com eSigner — see README),
 #           MACOS_CERT_P12 / MACOS_CERT_PASSWORD / MACOS_SIGN_IDENTITY,
 #           APPLE_ID / APPLE_TEAM_ID / APPLE_APP_PASSWORD (notarisation),
 #           MIN_AGENT_VERSION (manifest floor).
 #
-# NOT YET BUILT: installers. This publishes zips, so a user extracts and runs
-# the agent by hand and it does NOT start at login. The .msi/.pkg steps are
-# marked TODO below; the stable aliases point at the zips until they exist,
-# rather than at installer URLs that would 404.
+# Windows ships a per-user .msi (packaging/windows) that installs to
+# %LOCALAPPDATA%\Programs, registers autostart by calling the agent's own
+# -install, and needs no UAC prompt. The zip is still published beside it for
+# anyone who would rather not run an installer.
+#
+# NOT YET BUILT: the macOS .pkg. The darwin build publishes a zip, so a Mac
+# user extracts and runs the agent by hand and it does NOT start at login.
 
 on:
   push:
@@ -40,7 +44,9 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
-      CERT_PFX_BASE64: ${{ secrets.CERT_PFX }}
+      # Presence of the username is the signing gate. `secrets` cannot be read
+      # from a step-level `if:`, so it is hoisted to the job env first.
+      ES_USERNAME: ${{ secrets.ES_USERNAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -99,35 +105,54 @@ jobs:
           test -s stage/windows/LICENSE-SumatraPDF.txt
           grep -q 'GNU GENERAL PUBLIC LICENSE' stage/windows/LICENSE-SumatraPDF.txt
 
-      - name: Sign (Authenticode)
-        if: ${{ env.CERT_PFX_BASE64 != '' }}
-        shell: pwsh
-        env:
-          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
-          TIMESTAMP_URL: ${{ vars.TIMESTAMP_URL }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
-          $ts = if ($env:TIMESTAMP_URL) { $env:TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
-          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $signtool) { throw 'signtool.exe not found (Windows SDK missing on runner)' }
-          # Only our own binaries. SumatraPDF ships already signed by its
-          # authors; re-signing it would misattribute someone else's work.
-          Get-ChildItem stage\windows\sally-print-agent-*.exe | ForEach-Object {
-            & $signtool.FullName sign /fd SHA256 /tr $ts /td SHA256 /f $pfx /p $env:CERT_PASSWORD $_.FullName
-            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed on $($_.Name)" }
-            & $signtool.FullName verify /pa /v $_.FullName
-            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on $($_.Name)" }
-          }
-          Remove-Item $pfx -Force
+      # ── Authenticode, via SSL.com's eSigner cloud HSM ─────────────────────
+      #
+      # There is no .pfx to hold. Since 1 June 2023 the CA/Browser Forum
+      # baseline requirements oblige every publicly trusted code-signing key —
+      # OV as much as EV — to be generated on, and non-exportable from,
+      # FIPS 140-2 L2 hardware. No CA sells a downloadable certificate any
+      # more, so the key never reaches this runner: CodeSignTool sends a
+      # digest to SSL.com and gets a signature back.
+      #
+      # Azure Artifact Signing is cheaper and needs no long-lived secrets at
+      # all, but it does not issue public-trust certificates to Indian
+      # entities, which is what Sally ERP is.
+      #
+      # CodeSignTool timestamps against SSL.com's own TSA, so unlike the
+      # signtool invocation this replaced there is no timestamp URL to set.
+      #
+      # One step per binary rather than the action's `dir_path`: that would
+      # take in SumatraPDF.exe, which ships already signed by its authors, and
+      # re-signing it would misattribute someone else's work.
+      - name: Sign the agent (amd64)
+        if: ${{ env.ES_USERNAME != '' }}
+        uses: sslcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}\stage\windows\sally-print-agent-amd64.exe
+          override: true
+
+      - name: Sign the agent (arm64)
+        if: ${{ env.ES_USERNAME != '' }}
+        uses: sslcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}\stage\windows\sally-print-agent-arm64.exe
+          override: true
 
       - name: Signing skipped notice
-        if: ${{ env.CERT_PFX_BASE64 == '' }}
+        if: ${{ env.ES_USERNAME == '' }}
         shell: bash
         run: |
-          echo "::warning::CERT_PFX not set — shipping an UNSIGNED Windows build."
+          echo "::warning::ES_USERNAME not set — shipping an UNSIGNED Windows build."
           echo "Endpoint security flags unsigned processes that open a listening socket."
 
       # ── Installers ────────────────────────────────────────────────────────
@@ -180,31 +205,47 @@ jobs:
               -d "Stage=$(pwd -W)/$s" \
               -o "out/sally-print-agent-$ver-windows-$wixarch.msi"
           done
+
+          # wix drops a .wixpdb beside each .msi. It is a build database for
+          # debugging installer internals, not something to hand a user, and
+          # out/ is uploaded wholesale.
+          rm -f out/*.wixpdb
           ls -la out
 
+      # The MSI is signed as well as the exe inside it: SmartScreen judges the
+      # thing the user double-clicks, which is the installer. `dir_path` is
+      # safe here where it was not for stage/windows — out/ holds nothing but
+      # the two MSIs at this point, the .wixpdb having just been removed.
       - name: Sign the MSIs (Authenticode)
-        if: ${{ env.CERT_PFX_BASE64 != '' }}
+        if: ${{ env.ES_USERNAME != '' }}
+        uses: sslcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          dir_path: ${{ github.workspace }}\out
+          override: true
+
+      # Verified here rather than inside each signing step, because this is
+      # the first point at which everything that ships exists: a signature the
+      # remote service quietly declined to apply fails the release now instead
+      # of reaching a customer's SmartScreen.
+      - name: Verify the signatures
+        if: ${{ env.ES_USERNAME != '' }}
         shell: pwsh
-        env:
-          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
-          TIMESTAMP_URL: ${{ vars.TIMESTAMP_URL }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
-          $ts = if ($env:TIMESTAMP_URL) { $env:TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
           $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $signtool) { throw 'signtool.exe not found (Windows SDK missing on runner)' }
-          # The MSI is signed as well as the exe inside it: SmartScreen judges
-          # the thing the user double-clicks, which is the installer.
-          Get-ChildItem out\*.msi | ForEach-Object {
-            & $signtool.FullName sign /fd SHA256 /tr $ts /td SHA256 /f $pfx /p $env:CERT_PASSWORD $_.FullName
-            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed on $($_.Name)" }
+          $artifacts = @(Get-ChildItem stage\windows\sally-print-agent-*.exe) + @(Get-ChildItem out\*.msi)
+          if ($artifacts.Count -ne 4) { throw "expected 4 signed artifacts, found $($artifacts.Count)" }
+          $artifacts | ForEach-Object {
             & $signtool.FullName verify /pa /v $_.FullName
             if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on $($_.Name)" }
           }
-          Remove-Item $pfx -Force
 
       - name: Package
         shell: bash

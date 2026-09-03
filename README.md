@@ -194,15 +194,36 @@ in the monorepo, or the tail of a deploy log.
 | `AWS_REGION` | `ap-south-1` |
 | `DOWNLOADS_BUCKET` | SST output `TallyDownloadsBucket` (one bucket serves both agents) |
 | `DOWNLOADS_DISTRIBUTION_ID` | SST output `TallyDownloadsDistributionId` |
-| `CERT_PFX` / `CERT_PASSWORD` *(optional)* | base64 of the Authenticode `.pfx`, and its password |
+| `ES_USERNAME` / `ES_PASSWORD` / `ES_CREDENTIAL_ID` / `ES_TOTP_SECRET` *(optional)* | SSL.com eSigner account, signing credential ID, and the TOTP secret that lets CI sign unattended — see [Windows code signing](#windows-code-signing) |
 | `MACOS_CERT_P12` / `MACOS_CERT_PASSWORD` / `MACOS_SIGN_IDENTITY` *(optional)* | Developer ID signing |
 | `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_PASSWORD` *(optional)* | notarisation |
 | `MIN_AGENT_VERSION` *(optional)* | forced-update floor written into `latest.json` |
-| `TIMESTAMP_URL` *(optional **variable**, not a secret)* | Authenticode timestamp server override |
 
 Every optional one is gated in the workflow, so a bare tag still builds:
 without the AWS secrets the S3 publish is skipped, and without the certificates
 the build ships **unsigned** with a warning.
+
+### Windows code signing
+
+The Windows binaries and both MSIs are signed through **SSL.com eSigner**, a
+cloud HSM, not from a `.pfx` held in a secret.
+
+That is not a preference. Since **1 June 2023** the CA/Browser Forum baseline
+requirements oblige every publicly trusted code-signing private key — OV as
+much as EV — to be generated on, and non-exportable from, FIPS 140-2 Level 2
+hardware. No CA issues a downloadable certificate any more, so a `CERT_PFX`
+secret is not a thing that can be provisioned; the key stays in SSL.com's HSM
+and CI sends it a digest.
+
+Azure Artifact Signing (formerly Trusted Signing) is cheaper at $9.99/month and
+authenticates over OIDC with no long-lived secret at all. It is **not an option
+for us**: public-trust certificates are issued only to entities in the US,
+Canada, the EU, the UK, Australia, New Zealand, Japan, South Korea, Singapore,
+Switzerland, Norway and Israel. Sally ERP is an Indian entity. Revisit this only
+if that list grows or the signing entity changes.
+
+Certificates now expire in **458 days** or less, so the renewal is roughly
+annual and the credential ID changes with it.
 
 ### This repo needs its OWN AWS user
 
