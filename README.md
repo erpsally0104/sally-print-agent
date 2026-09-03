@@ -211,14 +211,49 @@ Do **not** reuse the Tally connector's keys. Its policy is scoped to
 would be denied — and sharing one key would let either agent's CI overwrite the
 other's published installer.
 
+**Create it in account `095453158319`, and pass `--profile erp-sally` to every
+command below.** There are two AWS accounts within reach of a normal laptop
+here, and only one of them owns any of this:
+
+| Account | Profile | Identity | Owns |
+| --- | --- | --- | --- |
+| `095453158319` | `erp-sally` | `sally-deployer` | the bucket, the distribution — **this is the one** |
+| `405062306899` | `default` | `tally-admin` | something else entirely |
+
+`default` being the wrong one is the trap: omit `--profile` and every command
+below still succeeds, just in an account with no bucket and no distribution.
+That already happened once — a `sally-print-agent-ci` was created in
+`405062306899`, and the release published nothing until the mistake was found.
+Confirm with `aws sts get-caller-identity --profile erp-sally` before starting.
+
 The `sally-deployer` user carries AdministratorAccess, so it can create this
 user directly (the Tally connector's README says otherwise; that is stale):
 
 ```bash
-aws iam create-user --user-name sally-print-agent-ci
-aws iam put-user-policy --user-name sally-print-agent-ci \
+aws iam create-user --user-name sally-print-agent-ci --profile erp-sally
+aws iam put-user-policy --user-name sally-print-agent-ci --profile erp-sally \
   --policy-name publish-print-agent --policy-document file://ci-policy.json
-aws iam create-access-key --user-name sally-print-agent-ci
+aws iam create-access-key --user-name sally-print-agent-ci --profile erp-sally
+```
+
+Feed that key straight into the repo secrets — a trailing newline is enough to
+make CI fail with `The security token included in the request is invalid`,
+which reads like a permissions problem and is not one:
+
+```bash
+printf '%s' 'AKIA…'          | gh secret set AWS_ACCESS_KEY_ID
+printf '%s' '<secret>'       | gh secret set AWS_SECRET_ACCESS_KEY
+printf '%s' 'ap-south-1'     | gh secret set AWS_REGION
+```
+
+To check the policy without waiting for a release, ask IAM directly rather
+than reading it back:
+
+```bash
+aws iam simulate-principal-policy --profile erp-sally \
+  --policy-source-arn arn:aws:iam::095453158319:user/sally-print-agent-ci \
+  --action-names s3:PutObject \
+  --resource-arns arn:aws:s3:::sally-tally-downloads-production/print-agent/latest.json
 ```
 
 `ci-policy.json`, with this account's real values already filled in:
