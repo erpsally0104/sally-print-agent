@@ -130,8 +130,80 @@ jobs:
           echo "::warning::CERT_PFX not set — shipping an UNSIGNED Windows build."
           echo "Endpoint security flags unsigned processes that open a listening socket."
 
-      # TODO: build an .msi here that installs to Program Files and registers a
-      # Run key so the agent starts at login. Until then this zip is manual.
+      # ── Installers ────────────────────────────────────────────────────────
+      # One MSI per architecture. Each gets its own staging directory with the
+      # agent renamed to a fixed sally-print-agent.exe, because the installed
+      # filename must not carry an architecture the Run key would then have to
+      # know about.
+      - name: Install WiX
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet tool install --global wix
+          "$USERPROFILE/.dotnet/tools/wix.exe" --version
+          # WixQuietExec64, used to run the agent's -uninstall on removal.
+          "$USERPROFILE/.dotnet/tools/wix.exe" extension add --global WixToolset.Util.wixext
+
+      - name: Build the MSIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          # ProductVersion must be purely numeric; a dispatch build calls
+          # itself 0.0.0-dev, which MSI will not accept.
+          msiver="${ver%%-*}"
+          wix="$USERPROFILE/.dotnet/tools/wix.exe"
+          mkdir -p out
+
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) wixarch=x64   ;;
+              arm64) wixarch=arm64 ;;
+            esac
+
+            s="msi-stage/$arch"
+            mkdir -p "$s"
+            cp "stage/windows/sally-print-agent-$arch.exe" "$s/sally-print-agent.exe"
+            # SumatraPDF ships x64 only; on arm64 Windows it runs emulated,
+            # which is still better than no printing at all.
+            cp stage/windows/SumatraPDF.exe            "$s/SumatraPDF.exe"
+            cp stage/windows/THIRD-PARTY-NOTICES.md    "$s/THIRD-PARTY-NOTICES.md"
+            cp stage/windows/LICENSE-SumatraPDF.txt    "$s/LICENSE-SumatraPDF.txt"
+
+            echo "building $wixarch MSI"
+            "$wix" build packaging/windows/sally-print-agent.wxs \
+              -arch "$wixarch" \
+              -d "Version=$msiver" \
+              -d "Stage=$(pwd -W)/$s" \
+              -ext WixToolset.Util.wixext \
+              -o "out/sally-print-agent-$ver-windows-$wixarch.msi"
+          done
+          ls -la out
+
+      - name: Sign the MSIs (Authenticode)
+        if: ${{ env.CERT_PFX_BASE64 != '' }}
+        shell: pwsh
+        env:
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+          TIMESTAMP_URL: ${{ vars.TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+          $ts = if ($env:TIMESTAMP_URL) { $env:TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found (Windows SDK missing on runner)' }
+          # The MSI is signed as well as the exe inside it: SmartScreen judges
+          # the thing the user double-clicks, which is the installer.
+          Get-ChildItem out\*.msi | ForEach-Object {
+            & $signtool.FullName sign /fd SHA256 /tr $ts /td SHA256 /f $pfx /p $env:CERT_PASSWORD $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed on $($_.Name)" }
+            & $signtool.FullName verify /pa /v $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on $($_.Name)" }
+          }
+          Remove-Item $pfx -Force
+
       - name: Package
         shell: bash
         run: |
@@ -139,7 +211,7 @@ jobs:
           ver="${{ steps.ver.outputs.version }}"
           mkdir -p out
           (cd stage/windows && 7z a -tzip "../../out/sally-print-agent-$ver-windows.zip" .)
-          (cd out && sha256sum "sally-print-agent-$ver-windows.zip" > "sally-print-agent-$ver-windows.zip.sha256")
+          (cd out && for f in *.zip *.msi; do sha256sum "$f" > "$f.sha256"; done)
           ls -la out
 
       - uses: actions/upload-artifact@v4

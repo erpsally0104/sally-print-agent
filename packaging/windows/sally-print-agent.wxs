@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  Per-user MSI for the Sally Print Agent.
+
+  Scope="perUser" is not a preference, it is a correctness requirement. The
+  agent registers autostart in HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+  (see autostart_windows.go). A per-machine MSI runs its actions elevated, so
+  HKCU there is the *elevating administrator's* hive — the agent would be
+  registered to start for whoever typed the admin password, and never for the
+  person who actually installed it. Nothing would report an error.
+
+  Per-user also means no UAC prompt at all, which matters for something a
+  counter clerk installs themselves, and it matches the rest of the design:
+  per-user config in %APPDATA%, per-user printer connections, and deliberately
+  not a Windows service (session 0 cannot see those printers).
+
+  Autostart is registered by calling the agent's own -install rather than by
+  writing the Run key from here. Two implementations of the same registration
+  drift; the agent's is the one with tests behind it.
+
+  Build (see .github/workflows/release.yml):
+    wix build sally-print-agent.wxs -arch x64 \
+      -d Version=1.2.3 -d Stage=..\..\stage\windows -d Arch=amd64 \
+      -o sally-print-agent-1.2.3-windows-x64.msi
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Sally Print Agent"
+      Manufacturer="Sally ERP"
+      Version="$(var.Version)"
+      UpgradeCode="550A9DEA-0F3C-4DBE-B63C-25794508707E"
+      Scope="perUser"
+      Compressed="yes"
+      InstallerVersion="500">
+
+    <SummaryInformation Description="Prints from Sally to a chosen printer without the browser print dialog." />
+
+    <!-- Upgrades replace in place. The agent holds no state in its install
+         directory — config and log live in %APPDATA%\SallyPrintAgent — so an
+         upgrade needs no migration. -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of Sally Print Agent is already installed. Uninstall it first." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.Stage)\sally-print-agent.exe" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://sallyerp.in" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- %LOCALAPPDATA%\Programs is where per-user apps belong; it is what
+         Windows itself uses for per-user installs and needs no elevation. -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="SallyPrintAgent" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ShortcutFolder" Name="Sally Print Agent" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AgentFiles" Directory="INSTALLFOLDER">
+      <Component Id="AgentExe" Guid="5D51D026-99E5-4B5E-A414-ACCA4C092204">
+        <File Id="AgentExeFile" Source="$(var.Stage)\sally-print-agent.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- Windows cannot print a PDF to a named printer on its own; the agent
+           shells out to this. Without it the agent runs but canPrint is false. -->
+      <Component Id="Helper" Guid="5DFCF1EA-B76E-48FC-A921-08BABE215F15">
+        <File Id="SumatraPdfExe" Source="$(var.Stage)\SumatraPDF.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- SumatraPDF is GPLv3 and we redistribute it, so both of these have to
+           travel with the binary, in the installer as well as in the zip. -->
+      <Component Id="Notices" Guid="36AEC29E-7362-4E1F-AE55-68C53C4A9F86">
+        <File Id="ThirdPartyNotices" Source="$(var.Stage)\THIRD-PARTY-NOTICES.md" KeyPath="yes" />
+      </Component>
+      <Component Id="HelperLicence" Guid="58ED3082-797A-40F1-9AAF-13233256F194">
+        <File Id="LicenceSumatra" Source="$(var.Stage)\LICENSE-SumatraPDF.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- The status page is the only UI the agent has, and it is where Quit and
+         the autostart toggle live. Without a Start menu entry there is no way
+         back to it once the browser tab is closed. -->
+    <ComponentGroup Id="AgentShortcuts" Directory="ShortcutFolder">
+      <Component Id="StatusShortcut" Guid="6E459D29-5C86-4C37-B504-3FC4DE159278">
+        <Shortcut Id="StartAgentShortcut"
+                  Name="Sally Print Agent"
+                  Description="Start the print agent and open its status page"
+                  Target="[INSTALLFOLDER]sally-print-agent.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveShortcutFolder" On="uninstall" />
+        <!-- A per-user component needs an HKCU keypath; a file under
+             ProgramMenuFolder would not be one. -->
+        <RegistryValue Root="HKCU" Key="Software\SallyERP\PrintAgent"
+                       Name="Shortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Sally Print Agent" Level="1">
+      <ComponentGroupRef Id="AgentFiles" />
+      <ComponentGroupRef Id="AgentShortcuts" />
+    </Feature>
+
+    <!-- ── Custom actions ──────────────────────────────────────────────────
+         Impersonate="yes" throughout: every one of these has to run as the
+         installing user, because HKCU is the whole point. -->
+
+    <!-- An agent from a previous version is holding sally-print-agent.exe
+         open, and MSI cannot replace or delete a running binary. Go programs
+         do not register with the Restart Manager, so MSI has no way to ask
+         politely. Returns 128 when nothing is running, hence Return="ignore". -->
+    <SetProperty Id="StopRunningAgent"
+                 Value="&quot;[System64Folder]taskkill.exe&quot; /IM sally-print-agent.exe /F"
+                 Before="StopRunningAgent"
+                 Sequence="execute" />
+    <CustomAction Id="StopRunningAgent"
+                  DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="ignore" />
+
+    <!-- -install registers autostart and then deliberately falls through into
+         serving, so the agent is printing before the installer's progress bar
+         has finished. That means it never returns: asyncNoWait is required,
+         not an optimisation. -->
+    <CustomAction Id="RegisterAutostart"
+                  FileRef="AgentExeFile"
+                  ExeCommand="-install"
+                  Execute="immediate"
+                  Impersonate="yes"
+                  Return="asyncNoWait" />
+
+    <!-- Leaving the Run key behind would point at a deleted executable, and
+         Windows would fail silently at every login from then on. -->
+    <SetProperty Id="UnregisterAutostart"
+                 Value="&quot;[INSTALLFOLDER]sally-print-agent.exe&quot; -uninstall"
+                 Before="UnregisterAutostart"
+                 Sequence="execute" />
+    <CustomAction Id="UnregisterAutostart"
+                  DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="UnregisterAutostart" Before="StopRunningAgent" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="StopRunningAgent" Before="RemoveFiles" />
+      <Custom Action="RegisterAutostart" After="InstallFinalize" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
