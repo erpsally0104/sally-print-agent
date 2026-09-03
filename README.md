@@ -50,8 +50,23 @@ when you break it, bump the prefix rather than redefining `/v1` in place.
 
 ## Installing
 
-The release ships a zip, not an installer yet, so setup is two steps: extract
-it somewhere permanent, then register it.
+Windows has an installer; macOS has one that has never been run on a Mac. Both
+put the files somewhere permanent and register start-at-login, so there is
+nothing to do afterwards.
+
+| | |
+| --- | --- |
+| Windows | `sally-print-agent-windows.msi` — per-user, **no administrator prompt** |
+| macOS | `sally-print-agent-macos.pkg` — installs to `/usr/local/bin`, asks for admin |
+
+The Windows package installs to `%LOCALAPPDATA%\Programs\SallyPrintAgent`
+deliberately. Autostart is an `HKCU` Run key, and a per-machine package runs
+its actions elevated — `HKCU` there belongs to whoever typed the administrator
+password, so the agent would start at login for them and never for the person
+who installed it, with nothing reporting an error.
+
+The zip is still published for anyone who would rather not run an installer.
+Extract it somewhere permanent, then register it by hand:
 
 ```
 sally-print-agent -install     # start at login, and start now
@@ -304,31 +319,31 @@ OIDC role once an OIDC provider exists in the account.)
 
 ## Not done yet
 
-The binaries build and run; **packaging and distribution do not exist**. Before
-this can go on the website:
+The installers build and the release publishes them. What is left:
 
-- **Code signing.** An Apple Developer ID plus notarisation, or macOS refuses
-  to launch it. A Windows code-signing certificate, or endpoint security will
-  flag a listening unsigned process.
-- **Installers.** `.pkg`/`.dmg` for macOS, `.msi` for Windows, each registering
-  start-at-login — a `Run` key or Startup entry on Windows (a *Service* is the
-  wrong choice: session 0 has no user profile and cannot see per-user printer
-  connections), a LaunchAgent with `RunAtLoad`/`KeepAlive` on macOS.
+- **Certificates.** The signing steps are written and gated on secrets, so
+  every release still builds without them — and ships **unsigned**. Windows
+  needs an SSL.com eSigner credential (`ES_*`); macOS needs an Apple
+  Developer ID Application certificate to sign the binary, a Developer ID
+  *Installer* certificate to sign the pkg, and an app-specific password to
+  notarise. Until then macOS refuses to launch the agent at all, and Windows
+  endpoint security flags a listening unsigned process.
 - **An update path**, or the agent rots. The protocol is small and versioned
-  (`/v1`) specifically so an old agent keeps working. Follow the Tally
-  connector's `latest.json` shape (version, root-relative url, sha256,
-  minVersion, mandatory, releasedAt) so both agents update the same way.
+  (`/v1`) specifically so an old agent keeps working. `latest.json` is already
+  published in the Tally connector's shape and now carries `zipUrl` beside
+  `url`, because an updater replacing a binary in place wants the
+  extract-and-run build rather than an installer that would prompt.
 - **A "Direct printing is off" hint** in the print dialog, linking to the
   installer. The URLs are already wired through as
-  `NEXT_PUBLIC_PRINT_AGENT_WINDOWS_URL` / `..._MAC_URL`.
-- **Installers** (`.msi` / `.pkg`). Start-at-login itself is done — the
-  installer's remaining job is putting the files somewhere permanent and
-  calling `-install`, rather than reimplementing it in a packaging script.
-- **A real print on paper.** Everything up to the spooler is verified —
-  enumeration, refusals, `canPrint` flipping true with the helper present — but
-  no sheet has actually come out of a printer yet.
-- **Running it on a Mac at all.** The darwin builds cross-compile; they have
-  never been executed.
+  `NEXT_PUBLIC_PRINT_AGENT_WINDOWS_URL` / `..._MAC_URL` — note these now point
+  at `.msi` / `.pkg`; the `.zip` aliases are still published beside them.
+- **A real print on paper.** The path is verified as far as the Windows
+  spooler: a job submitted through `/v1/print` was accepted, rendered to one
+  page, and queued on a real printer. No sheet has come out of one yet.
+- **Running it on a Mac at all.** The darwin builds cross-compile and the pkg
+  assembles, but neither has ever been executed. The pkg scripts in
+  particular — dropping to the console user via `launchctl asuser` — have
+  never run anywhere.
 
 ## Configuration
 
