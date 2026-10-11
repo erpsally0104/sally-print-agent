@@ -1,7 +1,11 @@
-# Sally Print Agent
+# Sally Desktop (the Sally Print Agent)
 
 A small service users install on their own machine so Sally can print to a
-**chosen printer** with no browser print dialog.
+**chosen printer** with no browser print dialog, and so a desk scanner can
+send **signed copies** to Sally by itself. In Sally's screens it is called
+**Sally Desktop** (printing and scanning). The binary, the installers, their
+file names and the download URLs keep the `sally-print-agent` name, so
+existing installs upgrade in place.
 
 Its own repository, separate from the `erp-sally` monorepo, because it ships as
 a signed downloadable binary on its own release cadence — the same arrangement
@@ -115,9 +119,147 @@ through in full at the top of [`security.go`](security.go). In short:
 | Token, delivered automatically to allowlisted origins | Other local processes; also makes pairing invisible |
 | Printer names resolved against the enumerated list | Command injection through a printer name |
 | 64 MiB body cap, 20-copy cap, 30 jobs/minute | Memory exhaustion and paper exhaustion |
+| Scanner controls (`/scan/*`) are POST only, need the page's per-process random token (`X-Sally-CSRF`, embedded in the status page), the `X-Sally-Local` marker, a `Host` of `127.0.0.1:port` or `localhost:port`, and no `Origin` other than the page's own; no CORS headers | Any web page, Sally included, pausing, scanning, pairing or pointing the agent at another scanner; DNS rebinding |
+| `/status.json` (what the page polls) is GET only with the same Host, Origin and marker checks, no CORS, and counts only | Other sites reading scanner state |
+| The status page itself refuses a foreign `Host` | DNS rebinding reading the print token or the page token |
+
+**No web page can start a scan.** Scanning adds no endpoint a web page can
+call: nothing under `/v1` changed, and the `/scan/*` controls answer only the
+status page. A scan starts from the scanner's own feeder, from a command on
+Sally's heartbeat (which only a signed-in person with `voucher.acknowledge`
+can queue), or from the Scan now button on the status page.
+
+**What the scanner's Sally token can do.** It is a device token with
+capability `SCAN`, approved by one person for one company.
+
+| It can | It cannot |
+| --- | --- |
+| announce stacks, upload scanned sides to presigned S3 URLs and confirm them | read invoices, parties, amounts or any other company data |
+| read its own settings and commands, and report status on the heartbeat | call any Tally route (`/api/agent/companies`, `sync/*`, `reconcile`, …): they refuse a SCAN token |
+| all of it for the one approved company only | act for any other company, or be used as a browser session |
+
+Sally checks it on every call against the approver's `voucher.acknowledge`
+in that company and the company's plan; it can be revoked from Sally
+Settings at any time (the agent then shows "Connect to Sally"). On the PC it
+is stored with DPAPI (`scan-token.dat`), never in `config.json`.
+
+**The outbox at rest.** Pages waiting to go up are sealed with DPAPI in user
+scope on Windows, so another Windows account or a copied disk cannot read
+them; elsewhere they are `0600` files in a `0700` directory. Each side's
+SHA-256 is recorded and checked before upload. Copies are deleted once Sally
+confirms them, or after 7 days when "Keep a copy" is on.
 
 Nothing is ever passed to a shell. Commands are executed with separated
 arguments, and only a printer name the OS itself reported can reach one.
+
+## Scanning
+
+Sally Desktop watches one scanner, scans whatever is put in its feeder, keeps
+every page safe on the PC, and sends the pages to Sally as one run per stack
+(the wire contract is `erp-sally` `docs/signed-copies/p1-desktop-api.md`). The
+code is in `internal/`:
+
+| Package | Does |
+| --- | --- |
+| `internal/escl` | eSCL client (capabilities, status, scan job, pages); HTTP transport and a hand-written HTTP/1.1 stream transport |
+| `internal/usbscan` | Windows: finds and opens the IPP-over-USB channel (stub elsewhere) |
+| `internal/mdns` | a minimal mDNS browser for `_uscan._tcp` / `_uscans._tcp` |
+| `internal/autoscan` | the pure state machine that decides when a scan starts |
+| `internal/outbox` | the encrypted on-disk outbox, its manifests and the background uploader |
+| `internal/sally` | pairing, heartbeat, stack calls and presigned S3 PUTs |
+| `internal/secure` | DPAPI (Windows) for the device token and the pages |
+| `internal/singleinstance` | the scanner lock: only one copy drives the scanner |
+| `internal/sound` | the three sounds, generated in code, played through winmm |
+| `internal/desktop` | ties them together; the status page's Scanner card reads it |
+
+**The scanner on USB (Windows).** Scanners such as the HP ScanJet Pro N4000
+expose IPP-over-USB (class 7/1/4, driver `usbprint`) and nothing in WIA. The
+agent asks SetupAPI for the device interface
+`{f2f40381-f46d-4e51-bce7-62de6cf2d098}` and, because that found nothing on the
+real machine, also reads the subkeys of
+`HKLM\SYSTEM\CurrentControlSet\Control\DeviceClasses\{f2f40381-…}` (a subkey
+`##?#USB#…` is the path `\\?\USB#…`; ones whose `#\Control` has `Linked = 1`
+come first). It opens the path with overlapped I/O and speaks plain HTTP/1.1
+over it with `Host: localhost:60000`. Every request goes out in one complete,
+unbuffered write; stale bytes are drained before each request; every read has
+a timeout (CancelIoEx on expiry). All of it through `package syscall`: no cgo,
+no `golang.org/x/sys`.
+
+**Network scanners** are found with an mDNS query for `_uscan._tcp.local` and
+`_uscans._tcp.local` (TXT `rs` gives the eSCL path), or by an IP or
+`host[:port]` typed on the status page. HTTPS scanners use self-signed
+certificates, so certificate checking is switched off **for that scanner's
+client only**: the client that talks to Sally always verifies.
+
+**The scan.** One job per feeder load: A4, feeder, duplex, colour (RGB24),
+300 dpi, JPEG, with the `pwg:Version` the scanner reports (2.63 if it names
+none). `BlankPageDetectionAndRemoval` is never sent (the N4000 answers 409,
+and Sally needs the blank backs as markers). Pages come from `NextDocument`
+until 404, in scan order: sheet 1 side 1, sheet 1 side 2, sheet 2 side 1… A
+page is checked to start with `FF D8` and is otherwise **never decoded or
+re-encoded**: scanners often end a JPEG a row short, which Go's decoder
+rejects, and the bytes go to Sally exactly as the scanner made them.
+
+**Starting by itself.** A scan starts when paper has been in an idle feeder,
+continuously, for the start delay (2, 3 or 5 s from Sally; 3 by default). There
+is no "empty → loaded" edge to wait for, so it also starts after a paper jam
+is cleared. After any job it waits until it has seen the scanner in some other
+state (feeder empty, jam, cover open, busy) before it can start again, so a
+load the scanner refuses to feed does not loop. Nothing starts while paused or
+while auto-start is off in Sally; paper put in then is not sent when that
+changes (take it out and put it back, or press Scan now).
+
+**A paper jam.** The job ends; the sides already received are kept and sent as
+**their own stack**; the note says "Paper jam. Open the cover, take out the
+stuck sheet and put it back on top of the stack. Sally kept the N sheets
+already scanned and sets aside anything scanned twice." Once the scanner
+reports the jam cleared and the rest is back in the feeder, the next stack
+starts by itself. Sally's page fingerprints set aside a sheet scanned twice.
+
+**The outbox.** Each side is written to disk the moment it arrives: sealed
+with DPAPI (user scope) on Windows, a `0600` file in a `0700` directory
+elsewhere, fsynced, then recorded in the stack's `manifest.json` (written
+through a temp file, fsync and rename). Only when every side of the stack is
+on disk does the page say **"Got 48 sheets. Safe on this PC."** and play the
+rising chime. Uploads run in the background, three sides at a time, through
+`/api/agent/scan/stacks…` and presigned S3 PUTs; they back off when offline
+and resume after a restart from the manifests (Sally reports the sides it
+already holds). After Sally confirms a side, the local copy is deleted, or
+kept 7 days when "Keep a copy" is on (the default); a janitor removes kept
+copies after 7 days. The outbox lives in `outbox/` beside `config.json`.
+
+**Sounds.** A tick when a scan starts, a rising chime when a stack is safe, a
+low falling tone on a problem (again after 30 s if a jam is still there).
+Generated in code as small WAVs and played with winmm `PlaySoundW`
+(`SND_MEMORY|SND_ASYNC`), `MessageBeep` as a fallback; silent on other
+systems. Sounds can be switched off on the status page.
+
+**Connecting to Sally.** "Connect to Sally" on the status page runs the device
+grant with capability `SCAN`: it opens `/connect?code=…` in the browser and
+shows the code; the person approves one company in Sally. The token is stored
+with DPAPI in `scan-token.dat`. A `401` drops it and shows "Connect to Sally"
+again (pages stay in the outbox); a `403` keeps it, keeps scanning into the
+outbox and shows why. Sally's address is `https://sallyerp.in` unless
+`sallyBaseUrl` in `config.json`, `SALLY_BASE_URL` or `-sally-url` says
+otherwise (plain http only to localhost).
+
+**Heartbeat and commands.** About every 10 s (Sally's `heartbeatSec`), and at
+once after a stack: scanner kind, name and state, feeder loaded, pause, outbox
+counts, version. Never page content. The answer carries the PC's settings and
+single-shot commands: `SCAN_NOW` and `TEST_SCAN` scan once as soon as paper is
+in an idle feeder (within two minutes), even while paused; `PAUSE` (15, 60 or
+until resumed) and `RESUME`. Unknown kinds are ignored. A `TEST_SCAN` is an
+ordinary stack, uploaded like any other: the Setup wizard's "try one copy"
+watches for the next run from this PC.
+
+**Pause** from the status page or from Sally: 15 minutes, 1 hour, or until
+resumed. It survives a restart.
+
+**One copy scans.** Printing copes with a second copy (it binds the next port).
+Scanning cannot share a feeder, so only the copy holding the scanner lock (a
+named mutex on Windows, a `flock` elsewhere) watches the scanner, sends the
+outbox and sends heartbeats. A second copy only prints and says so on its
+status page.
 
 ## Platform notes
 
@@ -178,11 +320,16 @@ on a Mac). Output ~8 MB per target in `dist/`.
 
 The absence of cgo is why the agent has a **status page instead of a tray
 icon** — every tray library needs cgo, which would mean building each platform
-on that platform. `http://127.0.0.1:17777/` shows status, the printer list, the
-token and a Quit button, and is refused to web pages.
+on that platform. `http://127.0.0.1:17777/` ("Sally Desktop: printing and
+scanning") shows status, the printer list, the token, the Scanner card and a
+Quit button, and is refused to web pages.
 
 ```bash
-go test ./...   # security controls, the request path, autostart comparison
+go test ./...   # security controls, the request path, autostart comparison,
+                # and scanning: eSCL settings and status, chunked reads and the
+                # drain over a fake USB handle, the auto-start state machine
+                # (jam included), mDNS packets, the outbox, pairing, heartbeat
+                # commands and the stack upload against fake Sally + S3
 go vet ./...
 ```
 
@@ -321,6 +468,13 @@ OIDC role once an OIDC provider exists in the account.)
 
 The installers build and the release publishes them. What is left:
 
+- **Scanning on real hardware.** The USB path (SetupAPI, the DeviceClasses
+  registry, overlapped I/O, DPAPI, PlaySoundW) cross-compiles and vets, but has
+  not run against the HP N4000 in this form. Check first: that the registry
+  path is found and opened, that a status poll answers within a second, that
+  the drain does not eat the start of a reply, and that a 50-sheet duplex
+  stack arrives as 100 sides in order.
+
 - **Certificates.** The signing steps are written and gated on secrets, so
   every release still builds without them — and ships **unsigned**. Windows
   needs an SSL.com eSigner credential (`ES_*`); macOS needs an Apple
@@ -357,9 +511,14 @@ The installers build and the release publishes them. What is left:
   "token": "…",
   "machineId": "…",
   "allowedOrigins": ["https://sallyerp.in", "http://localhost:3000"],
-  "helperPath": ""
+  "helperPath": "",
+  "sallyBaseUrl": "https://sallyerp.in"
 }
 ```
+
+Beside it: `scan.json` (the paired company, pause, sounds, keep-a-copy, a typed
+scanner address, Sally's last settings; nothing secret), `scan-token.dat` (the
+Sally device token, DPAPI on Windows) and `outbox/` (pages waiting to go up).
 
 `machineId` is random, not a hardware identifier: Sally uses it only to key the
 remembered printer per counter, and has no business fingerprinting the device.
@@ -372,4 +531,6 @@ The log sits beside it as `agent.log`, capped at 2 MB with one rotation.
 sally-print-agent            # bind the first free port of 17777–17780
 sally-print-agent -port 9000 # bind a specific port (Sally will not find it)
 sally-print-agent -version
+sally-print-agent -sally-url http://localhost:3000   # scanning against a dev Sally
+sally-print-agent -scan=false                        # print only
 ```
