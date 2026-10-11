@@ -34,7 +34,16 @@ type Config struct {
 	// there is no built-in way to print a PDF to a named printer. Empty means
 	// "look in the usual places" — see printers_windows.go.
 	HelperPath string `json:"helperPath,omitempty"`
+
+	// SallyBaseURL is where scanning pairs, reports and uploads (the same
+	// default as the Tally connector's sallyBaseUrl). The -sally-url flag
+	// or SALLY_BASE_URL overrides it for development without editing this
+	// file. Printing never uses it.
+	SallyBaseURL string `json:"sallyBaseUrl,omitempty"`
 }
+
+// defaultSallyBaseURL is Sally's production address.
+const defaultSallyBaseURL = "https://sallyerp.in"
 
 // defaultAllowedOrigins is intentionally short. Adding an origin here grants it
 // the ability to enumerate the user's printers and spool jobs to them.

@@ -22,11 +22,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/sallyerp/sally-print-agent/internal/desktop"
+	"github.com/sallyerp/sally-print-agent/internal/singleinstance"
 )
 
 // version is a var, not a const, so a release build can stamp it:
@@ -46,6 +50,8 @@ func main() {
 		install   = flag.Bool("install", false, "start the agent automatically at login, then run")
 		uninstall = flag.Bool("uninstall", false, "stop starting at login, then exit")
 		status    = flag.Bool("status", false, "report whether the agent starts at login, then exit")
+		sallyURL  = flag.String("sally-url", "", "Sally's address for scanning (default: config sallyBaseUrl, $SALLY_BASE_URL, or "+defaultSallyBaseURL+")")
+		scanOn    = flag.Bool("scan", true, "watch a scanner and send scanned pages to Sally")
 	)
 	flag.Parse()
 
@@ -128,6 +134,41 @@ func main() {
 		ErrorLog:          logger,
 	}
 
+	// Scanning. Only the copy holding the scanner lock watches the scanner;
+	// a second copy (on the next port) keeps printing exactly as before.
+	deskCtx, stopDesk := context.WithCancel(context.Background())
+	defer stopDesk()
+	deskDone := make(chan struct{})
+	if dir, derr := configDir(); derr == nil && *scanOn {
+		base, berr := resolveSallyURL(*sallyURL, os.Getenv("SALLY_BASE_URL"), cfg.SallyBaseURL)
+		if berr != nil {
+			logger.Printf("scanning is off: %v", berr)
+			srv.deskErr = berr.Error()
+			close(deskDone)
+		} else {
+			scanning := singleinstance.AcquireScanner(dir)
+			if !scanning {
+				logger.Printf("another copy of Sally Desktop drives the scanner; this one only prints")
+			}
+			desk, err := desktop.New(desktop.Options{
+				Dir: dir, BaseURL: base, Version: version,
+				Logf: logger.Printf, OpenBrowser: openBrowser, Scanning: scanning,
+			})
+			if err != nil {
+				logger.Printf("scanning could not start: %v", err)
+				srv.deskErr = err.Error()
+				close(deskDone)
+			} else {
+				srv.desk = desk
+				logger.Printf("scanning: Sally at %s", base)
+				go func() { desk.Run(deskCtx); close(deskDone) }()
+			}
+		}
+	} else {
+		srv.deskErr = "turned off"
+		close(deskDone)
+	}
+
 	// Both the Quit button and Ctrl+C land here.
 	shutdown := make(chan struct{})
 	var stopOnce = make(chan struct{}, 1)
@@ -151,7 +192,7 @@ func main() {
 	}()
 
 	logger.Printf("sally-print-agent %s listening on %s", version, srv.selfOrigin())
-	fmt.Printf("Sally Print Agent %s is running.\nStatus and controls: %s\n", version, srv.selfOrigin())
+	fmt.Printf("Sally Desktop %s is running (printing and scanning).\nStatus and controls: %s\n", version, srv.selfOrigin())
 
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -166,6 +207,13 @@ func main() {
 	defer cancel()
 	if err := httpSrv.Shutdown(ctx); err != nil {
 		logger.Printf("shutdown was not clean: %v", err)
+	}
+	// Stop scanning. Every page already on disk stays in the outbox and
+	// goes up after the next start.
+	stopDesk()
+	select {
+	case <-deskDone:
+	case <-time.After(3 * time.Second):
 	}
 	logger.Printf("stopped")
 }
@@ -242,4 +290,25 @@ func openLogger() (*log.Logger, string, func()) {
 
 	logger := log.New(io.MultiWriter(os.Stderr, f), "", log.LstdFlags|log.LUTC)
 	return logger, path, func() { _ = f.Close() }
+}
+
+// resolveSallyURL picks Sally's address for scanning: the flag, then the
+// environment, then config.json, then production. Only https is accepted,
+// except plain http to this machine for development.
+func resolveSallyURL(flagValue, envValue, configValue string) (string, error) {
+	raw := defaultSallyBaseURL
+	for _, v := range []string{configValue, envValue, flagValue} {
+		if v != "" {
+			raw = v
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil {
+		return "", fmt.Errorf("Sally's address %q is not valid", raw)
+	}
+	local := u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1"
+	if u.Scheme != "https" && !(u.Scheme == "http" && local) {
+		return "", fmt.Errorf("Sally's address %q must use https", raw)
+	}
+	return u.Scheme + "://" + u.Host, nil
 }

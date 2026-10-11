@@ -34,10 +34,26 @@ type server struct {
 	listPrinters func() ([]Printer, error)
 	printPDF     func(cfg *Config, path, printer, jobName string, copies int) error
 	canPrintFn   func(cfg *Config) bool
+
+	// desk is the scanning agent; nil when scanning could not start.
+	desk scanDesk
+	// deskErr says why scanning is not available, for the status page.
+	deskErr string
+	// csrf is a per-process random token the status page embeds and its
+	// scanner controls must send back.
+	csrf string
 }
 
 func newServer(cfg *Config, version string, logger *log.Logger) *server {
+	csrf, err := randomHex(32)
+	if err != nil {
+		// No randomness means no safe controls: requireLocalControl refuses
+		// everything while the token is empty.
+		logger.Printf("could not make the page token: %v", err)
+		csrf = ""
+	}
 	return &server{
+		csrf:    csrf,
 		cfg:     cfg,
 		version: version,
 		cache:   newPrinterCache(30 * time.Second),
@@ -68,6 +84,10 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("/", s.handleStatusPage)
 	mux.HandleFunc("/quit", s.requireLocalPage(s.handleQuit))
 	mux.HandleFunc("/autostart", s.requireLocalPage(s.handleAutostart))
+
+	// Scanning: the status page's own controls and the JSON it polls. Never
+	// a web page; see requireLocalControl.
+	s.scanRoutes(mux)
 
 	// The API Sally talks to. Every one of these is behind the origin
 	// allowlist; the last two additionally require the token.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -174,5 +175,98 @@ func (r *rateLimiter) allow(now time.Time) bool {
 		return false
 	}
 	r.times = append(r.times, now)
+	return true
+}
+
+// csrfHeader carries the status page's per-process random token on every
+// scanner control. The page embeds it; nothing else can read it.
+const csrfHeader = "X-Sally-CSRF"
+
+// selfOrigins are the two ways the status page can be opened.
+func (s *server) selfOrigins() []string {
+	return []string{s.selfOrigin(), fmt.Sprintf("http://localhost:%d", s.port)}
+}
+
+// hostAllowed reports whether a request's Host names this agent on
+// loopback. A DNS-rebinding page reaches 127.0.0.1 under its own name
+// (Host: evil.example:17777) and is refused here.
+func (s *server) hostAllowed(host string) bool {
+	h := strings.ToLower(host)
+	return h == fmt.Sprintf("127.0.0.1:%d", s.port) || h == fmt.Sprintf("localhost:%d", s.port)
+}
+
+func (s *server) originIsSelf(origin string) bool {
+	if origin == "" {
+		return true
+	}
+	for _, o := range s.selfOrigins() {
+		if strings.EqualFold(origin, o) {
+			return true
+		}
+	}
+	return false
+}
+
+// requireLocalControl guards the scanner controls on the status page (pause,
+// resume, scan now, connect to Sally, sounds, keep copies, scanner address).
+// Stricter than requireLocalPage, which still guards Quit and Start at login
+// unchanged:
+//
+//   - POST only;
+//   - Host must be 127.0.0.1:port or localhost:port (DNS rebinding);
+//   - an Origin, if present, must be the status page's own (any web page,
+//     Sally included, is refused);
+//   - the X-Sally-Local marker, which forces a preflight cross-origin;
+//   - the per-process CSRF token embedded in the status page.
+//
+// There are no CORS headers on these routes, so no other origin can read a
+// reply either. No web page can start a scan: scans start from the feeder,
+// from commands on the server heartbeat, or from here.
+func (s *server) requireLocalControl(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "use POST")
+			return
+		}
+		if !s.localRead(w, r) {
+			return
+		}
+		if s.csrf == "" || !tokenMatches(r.Header.Get(csrfHeader), s.csrf) {
+			writeJSONError(w, http.StatusForbidden, "missing or invalid page token")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+		next(w, r)
+	}
+}
+
+// requireLocalRead guards the status JSON the page polls: GET only, same
+// Host, Origin and marker rules as the controls, counts only in the reply.
+func (s *server) requireLocalRead(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSONError(w, http.StatusMethodNotAllowed, "use GET")
+			return
+		}
+		if !s.localRead(w, r) {
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *server) localRead(w http.ResponseWriter, r *http.Request) bool {
+	if !s.hostAllowed(r.Host) {
+		writeJSONError(w, http.StatusForbidden, "wrong host")
+		return false
+	}
+	if !s.originIsSelf(r.Header.Get("Origin")) {
+		writeJSONError(w, http.StatusForbidden, "not permitted from a web page")
+		return false
+	}
+	if r.Header.Get(localHeader) != "1" {
+		writeJSONError(w, http.StatusForbidden, "missing local marker")
+		return false
+	}
 	return true
 }
