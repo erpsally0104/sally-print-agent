@@ -42,6 +42,12 @@ Four controls, in order of how much work they actually do:
 
 Two more limits below the auth line: a byte cap on uploads and a rate limit on
 jobs, so that even an authorised bug cannot exhaust memory or a paper tray.
+
+Scanning adds no endpoint a web page can call. Its controls on the status
+page go through requireLocalControl below: POST, a loopback Host, no foreign
+Origin, the X-Sally-Local marker and a per-process token embedded in the
+page, with no CORS headers at all. Scans start from the feeder, from
+commands on Sally's heartbeat, or from that page.
 */
 
 // tokenHeader is deliberately custom: its presence forces a CORS preflight.
