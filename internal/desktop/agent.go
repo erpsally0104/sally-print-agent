@@ -749,9 +749,16 @@ func (a *Agent) watch(ctx context.Context, sc *Scanner) {
 			return
 		}
 		if kind != autoscan.None {
-			a.runJob(ctx, sc, kind)
+			jammed := a.runJob(ctx, sc, kind)
 			a.mu.Lock()
 			a.machine.Ended()
+			if jammed {
+				// The job's own last status showed the jam: that counts as
+				// "something other than idle with paper", even if the person
+				// clears it before the next poll.
+				paused, _ := a.local.paused(a.opt.Now())
+				a.machine.Observe(a.opt.Now(), autoscan.Observation{Reachable: true, Idle: true}, set, paused)
+			}
 			a.mu.Unlock()
 		}
 		t := time.NewTimer(a.opt.PollEvery)
@@ -768,8 +775,9 @@ func (a *Agent) watch(ctx context.Context, sc *Scanner) {
 }
 
 // runJob scans one feeder load into one stack (two if a load passes 1000
-// sides). Every side goes to disk as it arrives.
-func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) {
+// sides). Every side goes to disk as it arrives. It reports whether the job
+// ended in a jam.
+func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) bool {
 	a.logf("scan starting (%s)", kind)
 	sound.Play(sound.Tick)
 	a.mu.Lock()
@@ -787,7 +795,7 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) {
 	job, err := sc.Client.StartJob(ctx, escl.ScanSettings(sc.Client.Version))
 	if err != nil {
 		a.fail(fmt.Sprintf("The scanner did not start: %v", err), false)
-		return
+		return false
 	}
 
 	var w *outbox.StackWriter
@@ -864,6 +872,7 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) {
 		a.fail(problem, jam)
 	}
 	a.logf("scan finished: %d sides", total)
+	return jam
 }
 
 // finish closes a stack and says "safe" only if every side is on disk.
