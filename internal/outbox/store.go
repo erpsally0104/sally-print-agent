@@ -60,6 +60,12 @@ type Side struct {
 type Manifest struct {
 	Stack   string    `json:"stack"`
 	Created time.Time `json:"created"`
+	// CompanyID and DeviceID are the Sally company and device the stack was
+	// scanned for. A stack scanned before this PC was connected has neither
+	// and takes the first connection made; once set they never change, and
+	// the stack is sent only by that same device into that same company.
+	CompanyID string `json:"companyId,omitempty"`
+	DeviceID  string `json:"deviceId,omitempty"`
 	Sheets  int       `json:"sheets"`
 	// Complete: scanning finished and every side is on disk.
 	Complete bool `json:"complete"`
@@ -105,6 +111,41 @@ type Store struct {
 
 	mu     sync.Mutex
 	stacks map[string]*Manifest
+	// The connection stacks are sent with now (empty when not connected).
+	company, device string
+}
+
+// SetOwner names the Sally company and device this PC is connected as
+// (both empty when it is not). New stacks are stamped with them, stacks
+// scanned while unconnected take them, and only stacks stamped with them
+// are offered for sending. A stack stamped for another connection is held,
+// never sent and never deleted.
+func (s *Store) SetOwner(companyID, deviceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.company, s.device = companyID, deviceID
+	if companyID == "" {
+		return nil
+	}
+	var first error
+	for _, m := range s.stacks {
+		if m.CompanyID != "" {
+			continue
+		}
+		m.CompanyID, m.DeviceID = companyID, deviceID
+		// A run id from before the stack had an owner belongs to whatever
+		// connection made it; this connection announces the stack afresh.
+		m.RunID = ""
+		if err := s.writeManifest(m); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// mine reports whether m belongs to the current connection.
+func (s *Store) mine(m *Manifest) bool {
+	return s.company != "" && m.CompanyID == s.company && m.DeviceID == s.device
 }
 
 // Open opens (creating) the outbox under dir and loads every manifest, so a
@@ -210,7 +251,10 @@ func (s *Store) NewStack() (*StackWriter, error) {
 	if err := os.MkdirAll(s.stackDir(id), 0o700); err != nil {
 		return nil, err
 	}
-	m := &Manifest{Stack: id, Created: now.UTC(), Sides: []Side{}}
+	s.mu.Lock()
+	company, device := s.company, s.device
+	s.mu.Unlock()
+	m := &Manifest{Stack: id, Created: now.UTC(), CompanyID: company, DeviceID: device, Sides: []Side{}}
 	if err := s.writeManifest(m); err != nil {
 		return nil, err
 	}
@@ -348,7 +392,7 @@ func (s *Store) Stacks() []*Manifest {
 	defer s.mu.Unlock()
 	out := make([]*Manifest, 0, len(s.stacks))
 	for _, m := range s.stacks {
-		if m.Complete && !m.Done && m.Refused == "" {
+		if m.Complete && !m.Done && m.Refused == "" && s.mine(m) {
 			out = append(out, m.clone())
 		}
 	}
@@ -572,6 +616,9 @@ type Counts struct {
 	// Of the stacks still sending: sides in total and sides Sally holds.
 	SendingTotal int
 	SendingSent  int
+	// Held: stacks scanned for another company or device. They stay on
+	// this PC and are not sent.
+	Held int
 	// Refused stacks, newest first: Sally will not take them, and their
 	// pages are kept on this PC.
 	Refused []LastStack
@@ -608,6 +655,10 @@ func (s *Store) Counts() Counts {
 		}
 		if m.Refused != "" {
 			c.Refused = append(c.Refused, summarise(m))
+			continue
+		}
+		if m.CompanyID != "" && (m.CompanyID != s.company || m.DeviceID != s.device) {
+			c.Held++
 			continue
 		}
 		c.StacksWaiting++

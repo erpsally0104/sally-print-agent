@@ -53,6 +53,9 @@ func openStore(t *testing.T, dir string) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := s.SetOwner("co-1", "dev-1"); err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 
@@ -109,6 +112,7 @@ func TestNotSafeWhenASideFailedToWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.SetOwner("co-1", "dev-1")
 	w, _ := s.NewStack()
 	w.Add(page(0))
 	w.Add(page(1))
@@ -561,5 +565,71 @@ func TestOfflineStillStopsTheRound(t *testing.T) {
 	}
 	if c := s.Counts(); len(c.Refused) != 0 || c.StacksWaiting != 1 {
 		t.Fatalf("offline must not refuse a stack: %+v", c)
+	}
+}
+
+func TestAStackGoesOnlyToTheCompanyAndDeviceItWasScannedFor(t *testing.T) {
+	f := newFakeSally(t)
+	dir := t.TempDir()
+	s, err := Open(dir, xorSealer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clockMu sync.Mutex
+	now := time.Now()
+	s.Now = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		now = now.Add(time.Second)
+		return now
+	}
+
+	// Scanned before this PC was ever connected: no owner yet, and nothing
+	// to send it with.
+	early := scanStack(t, s, 2)
+	if len(s.Stacks()) != 0 {
+		t.Fatal("nothing is sendable before a connection")
+	}
+	if c := s.Counts(); c.StacksWaiting != 1 || c.Held != 0 {
+		t.Fatalf("an unconnected stack waits, it is not held: %+v", c)
+	}
+
+	// Connected to company 1: the early stack takes that connection.
+	s.SetOwner("co-1", "dev-1")
+	mine := scanStack(t, s, 2)
+	u := &Uploader{Store: s, API: f.client()}
+	if err := u.SendAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.done["run-"+early.Stack] != 1 || f.done["run-"+mine.Stack] != 1 {
+		t.Fatalf("done %v", f.done)
+	}
+
+	// A stack scanned for company 1 is still waiting when the PC is
+	// revoked and connected to company 2.
+	old := scanStack(t, s, 2)
+	s.SetOwner("", "")
+	s.SetOwner("co-2", "dev-2")
+	if st := s.Stacks(); len(st) != 0 {
+		t.Fatalf("a stack for another company was offered: %v", st[0].Stack)
+	}
+	if c := s.Counts(); c.Held != 1 || c.StacksWaiting != 0 {
+		t.Fatalf("counts %+v", c)
+	}
+	// Same company, another device: still held. The stamp never changes.
+	s.SetOwner("co-1", "dev-9")
+	if len(s.Stacks()) != 0 {
+		t.Fatal("a stack for another device was offered")
+	}
+	reopened := openStore(t, dir) // owner co-1/dev-1 again
+	st := reopened.Stacks()
+	if len(st) != 1 || st[0].Stack != old.Stack || st[0].CompanyID != "co-1" || st[0].DeviceID != "dev-1" {
+		t.Fatalf("stacks %+v", st)
+	}
+	// Held stacks are kept, whatever the janitor does.
+	s.Keep = func() bool { return false }
+	s.Clean()
+	if _, err := s.ReadSide(old.Stack, 1, 1); err != nil {
+		t.Fatal("a held stack lost a page")
 	}
 }

@@ -285,3 +285,13 @@ func TestStatusPageShowsARefusedStack(t *testing.T) {
 		t.Fatal("the refused stack is not on the page")
 	}
 }
+
+func TestStatusPageCountsStacksForAnotherCompany(t *testing.T) {
+	s, d := scanServer(t)
+	d.view.Held = 2
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "127.0.0.1:17777"
+	if page := serve(s, req).Body.String(); !strings.Contains(page, "2 stacks scanned for another company are kept on this PC.") {
+		t.Fatal("the held stacks are not on the page")
+	}
+}

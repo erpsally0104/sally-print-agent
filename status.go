@@ -207,6 +207,7 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
       {{end}}
       {{if .Problem}}<p class="problem">{{.Problem}}</p>{{end}}
       {{range .RefusedRows}}<p class="problem">{{.}}</p>{{end}}
+      {{if .HeldLine}}<p class="note">{{.HeldLine}}</p>{{end}}
       {{if .SendingLine}}
         {{if .SendingTotal}}<div class="bar"><span style="width:{{.SendingPct}}%"></span></div>{{end}}
         <p class="note">{{.SendingLine}}</p>

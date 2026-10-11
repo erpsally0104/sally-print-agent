@@ -163,6 +163,9 @@ func New(opt Options) (*Agent, error) {
 	case err == nil && l.CompanyID != "":
 		a.client.SetAuth(token, l.CompanyID)
 		a.paired = true
+		if err := store.SetOwner(l.CompanyID, l.DeviceID); err != nil {
+			opt.Logf("stamping waiting stacks with the connection failed: %v", err)
+		}
 	case err != nil && !errors.Is(err, secure.ErrNoToken):
 		opt.Logf("could not read the Sally token: %v", err)
 		a.needs = true
@@ -348,6 +351,9 @@ func (a *Agent) pair(ctx context.Context) {
 	a.mu.Lock()
 	a.local.CompanyID, a.local.CompanyName, a.local.DeviceID = p.CompanyID, p.CompanyName, p.DeviceID
 	a.saveLocked()
+	if err := a.store.SetOwner(p.CompanyID, p.DeviceID); err != nil {
+		a.logf("stamping waiting stacks with the connection failed: %v", err)
+	}
 	a.client.SetAuth(p.Token, p.CompanyID)
 	a.paired, a.needs, a.denied, a.pairing = true, false, "", nil
 	a.mu.Unlock()
@@ -377,6 +383,7 @@ func (a *Agent) dropToken() {
 	a.paired, a.needs = false, true
 	a.local.CompanyID, a.local.DeviceID = "", ""
 	a.saveLocked()
+	_ = a.store.SetOwner("", "")
 	a.mu.Unlock()
 	a.logf("Sally no longer accepts this PC's connection; pages stay in the outbox until it is connected again")
 }
@@ -604,6 +611,8 @@ type View struct {
 	Recent        []outbox.LastStack
 	// Refused stacks: Sally will not take them; their pages stay here.
 	Refused []outbox.LastStack
+	// Held: stacks scanned for another company or device, kept here.
+	Held int
 
 	SoundsOn       bool
 	KeepCopies     bool
@@ -650,6 +659,7 @@ func (a *Agent) Snapshot() View {
 		SendingSent:   c.SendingSent,
 		Recent:        c.Recent,
 		Refused:       c.Refused,
+		Held:          c.Held,
 
 		SoundsOn:       !a.local.SoundsOff,
 		KeepCopies:     !a.local.KeepOff,

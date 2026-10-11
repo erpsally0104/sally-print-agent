@@ -37,8 +37,9 @@ func pairedAgent(t *testing.T, baseURL string, disc Discoverer) *Agent {
 	if err := a.tokens.Set("tok"); err != nil {
 		t.Fatal(err)
 	}
-	a.local.CompanyID, a.local.CompanyName = "co-1", "Alpha Traders"
+	a.local.CompanyID, a.local.CompanyName, a.local.DeviceID = "co-1", "Alpha Traders", "dev-1"
 	a.client.SetAuth("tok", "co-1")
+	a.store.SetOwner("co-1", "dev-1")
 	a.paired, a.needs = true, false
 	return a
 }
@@ -397,5 +398,43 @@ func TestHeartbeatReportsARefusedStack(t *testing.T) {
 	}
 	if e := a.report().Error; e != "Sally refused 1 stack, kept on this PC: it does not know this stack" {
 		t.Fatalf("heartbeat error %q", e)
+	}
+}
+
+func TestAfterARepairStacksForTheOldCompanyAreHeld(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/pair/start":
+			io.WriteString(w, `{"deviceCode":"d","userCode":"WXYZ-1234","verificationUriComplete":"https://sally.test/connect","interval":1,"expiresIn":60}`)
+		case "/api/agent/pair/poll":
+			io.WriteString(w, `{"status":"approved","token":"new-tok","device":{"id":"dev-2","approvedCompanyIds":["co-2"],"capability":"SCAN"},"companyName":"Riverside Hotels"}`)
+		default:
+			w.WriteHeader(500)
+		}
+	}))
+	defer srv.Close()
+	a := pairedAgent(t, srv.URL, nil)
+	scan := func() string {
+		w, err := a.store.NewStack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := make([]byte, 100)
+		p[0], p[1] = 0xFF, 0xD8
+		w.Add(p)
+		r, _ := w.Finish("")
+		return r.Stack
+	}
+	scan() // for co-1 / dev-1
+	a.dropToken() // revoked
+	unconnected := scan()
+	a.pair(context.Background())
+
+	st := a.store.Stacks()
+	if len(st) != 1 || st[0].Stack != unconnected || st[0].CompanyID != "co-2" || st[0].DeviceID != "dev-2" {
+		t.Fatalf("only the stack scanned while unconnected may go to the new company: %+v", st)
+	}
+	if v := a.Snapshot(); v.Held != 1 {
+		t.Fatalf("held %d", v.Held)
 	}
 }

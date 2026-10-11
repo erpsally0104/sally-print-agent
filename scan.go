@@ -124,6 +124,7 @@ func (s *server) handleStatusJSON(w http.ResponseWriter, _ *http.Request) {
 			"stacksWaiting": v.StacksWaiting, "sidesWaiting": v.SidesWaiting,
 			"sendingTotal": v.SendingTotal, "sendingSent": v.SendingSent,
 		},
+		"held":    v.Held,
 		"receipt": v.Receipt,
 		"problem": v.Problem,
 		"stamp":   statusStamp(v),
@@ -159,6 +160,7 @@ func statusStamp(v desktop.View) string {
 	for _, r := range v.Refused {
 		add(r.Stack + r.Refused)
 	}
+	add(strconv.Itoa(v.Held))
 	add(strconv.FormatBool(v.SoundsOn) + strconv.FormatBool(v.KeepCopies) + v.ScannerAddress)
 	h := fnv.New64a()
 	h.Write(b)
@@ -198,6 +200,8 @@ type scanCard struct {
 	Rows        []string
 	// RefusedRows are stacks Sally refused, in words.
 	RefusedRows []string
+	// HeldLine counts stacks scanned for another company.
+	HeldLine string
 }
 
 func clock(t time.Time) string {
@@ -292,6 +296,10 @@ func (s *server) scanCard() scanCard {
 			row += " · refused by Sally"
 		}
 		c.Rows = append(c.Rows, row)
+	}
+	if v.Held > 0 {
+		c.HeldLine = fmt.Sprintf("%d %s scanned for another company %s kept on this PC.",
+			v.Held, plural2(v.Held, "stack", "stacks"), plural2(v.Held, "is", "are"))
 	}
 	for _, r := range v.Refused {
 		c.RefusedRows = append(c.RefusedRows, fmt.Sprintf("Stack %s: Sally refused it — %s; its pages are kept on this PC.", clock(r.At), r.Refused))
