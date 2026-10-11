@@ -240,3 +240,37 @@ func TestResolveSallyURL(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusPageCannotBeFramed(t *testing.T) {
+	s, _ := scanServer(t)
+	get := func(path, dest string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "127.0.0.1:17777"
+		req.Header.Set(localHeader, "1")
+		if dest != "" {
+			req.Header.Set("Sec-Fetch-Dest", dest)
+		}
+		return serve(s, req)
+	}
+	for _, path := range []string{"/", "/status.json"} {
+		rec := get(path, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d", path, rec.Code)
+		}
+		if rec.Header().Get("X-Frame-Options") != "DENY" || rec.Header().Get("Content-Security-Policy") != "frame-ancestors 'none'" {
+			t.Fatalf("%s: framing headers missing: %v", path, rec.Header())
+		}
+	}
+	if rec := get("/", "document"); rec.Code != http.StatusOK {
+		t.Fatalf("a top-level visit must work: %d", rec.Code)
+	}
+	for _, dest := range []string{"iframe", "frame", "IFRAME"} {
+		rec := get("/", dest)
+		if rec.Code != http.StatusForbidden || strings.Contains(rec.Body.String(), s.csrf) {
+			t.Errorf("Sec-Fetch-Dest %s: %d", dest, rec.Code)
+		}
+		if rec.Header().Get("X-Frame-Options") != "DENY" {
+			t.Errorf("Sec-Fetch-Dest %s: no X-Frame-Options on the refusal", dest)
+		}
+	}
+}

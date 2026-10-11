@@ -105,6 +105,7 @@ func (s *server) withDesk(fn func(d scanDesk, r *http.Request) error) http.Handl
 // handleStatusJSON is what the page polls to know when to refresh itself.
 // Counts and states only: never page content, never a token.
 func (s *server) handleStatusJSON(w http.ResponseWriter, _ *http.Request) {
+	noFraming(w)
 	if s.desk == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"scanning": false, "stamp": "off"})
 		return

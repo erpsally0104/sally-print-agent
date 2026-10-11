@@ -4,6 +4,7 @@ import (
 	"html/template"
 	"net/http"
 	"runtime"
+	"strings"
 )
 
 /*
@@ -41,10 +42,35 @@ type statusView struct {
 	Scan           scanCard
 }
 
+// noFraming tells the browser never to show a response inside another
+// page's frame. A framed status page would let the framing site steer
+// clicks onto its buttons (clickjacking), and those buttons drive the
+// scanner controls and Quit through the page's own script. The CSP carries
+// only frame-ancestors, so the page's inline style and script still run.
+func noFraming(w http.ResponseWriter) {
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+}
+
+// framed reports a request a browser made to fill a frame. Older browsers
+// that ignore frame-ancestors still send Sec-Fetch-Dest.
+func framed(r *http.Request) bool {
+	switch strings.ToLower(r.Header.Get("Sec-Fetch-Dest")) {
+	case "iframe", "frame", "embed", "object":
+		return true
+	}
+	return false
+}
+
 func (s *server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
 	// ServeMux's "/" matches everything; anything else is genuinely absent.
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
+		return
+	}
+	noFraming(w)
+	if framed(r) {
+		writeJSONError(w, http.StatusForbidden, "open this page in its own tab")
 		return
 	}
 	// A web page must not be able to read this — it carries the token.
