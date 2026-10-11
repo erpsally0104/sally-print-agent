@@ -161,6 +161,7 @@ func statusStamp(v desktop.View) string {
 		add(r.Stack + r.Refused)
 	}
 	add(strconv.Itoa(v.Held))
+	add(v.ApproverName + v.PCName + strconv.Itoa(v.TodayStacks) + "/" + strconv.Itoa(v.TodaySheets))
 	add(strconv.FormatBool(v.SoundsOn) + strconv.FormatBool(v.KeepCopies) + v.ScannerAddress)
 	h := fnv.New64a()
 	h.Write(b)
@@ -202,6 +203,10 @@ type scanCard struct {
 	RefusedRows []string
 	// HeldLine counts stacks scanned for another company.
 	HeldLine string
+	// ConnectedLine is "Connected as <approver> · <PC>", or the PC alone.
+	ConnectedLine string
+	// TodayLine counts today's stacks and sheets and the pages waiting.
+	TodayLine string
 }
 
 func clock(t time.Time) string {
@@ -224,6 +229,15 @@ func (s *server) scanCard() scanCard {
 		return c
 	}
 	c.ShowConnect = !v.Paired && (v.Pairing == nil || !v.Pairing.Waiting)
+	if v.ApproverName != "" {
+		c.ConnectedLine = "Connected as " + v.ApproverName + " · " + v.PCName
+	} else {
+		c.ConnectedLine = v.PCName
+	}
+	c.TodayLine = fmt.Sprintf("Today: %d %s · %d %s · %d %s waiting to go up",
+		v.TodayStacks, plural2(v.TodayStacks, "stack", "stacks"),
+		v.TodaySheets, plural2(v.TodaySheets, "sheet", "sheets"),
+		v.SidesWaiting, pagesWord(v.SidesWaiting))
 	if !v.ReceiptAt.IsZero() {
 		c.ReceiptWhen = clock(v.ReceiptAt)
 	}

@@ -677,3 +677,17 @@ func TestOneSidedScanNumbersEverySideAsItsOwnSheet(t *testing.T) {
 		t.Fatal("a one-sided stack takes at most 500 sheets")
 	}
 }
+
+func TestTodayCountsOnlyTodaysStacks(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	now := time.Now()
+	s.Now = func() time.Time { return now.Add(-48 * time.Hour) }
+	scanStack(t, s, 4) // two days ago
+	s.Now = func() time.Time { return now }
+	scanStack(t, s, 6)
+	scanStack(t, s, 1)
+	c := s.Counts()
+	if c.TodayStacks != 2 || c.TodaySheets != 4 || c.SidesWaiting != 11 {
+		t.Fatalf("%+v", c)
+	}
+}

@@ -150,7 +150,7 @@ func TestPairingStoresTheTokenAndCompany(t *testing.T) {
 		case "/api/agent/pair/start":
 			io.WriteString(w, `{"deviceCode":"d","userCode":"WXYZ-1234","verificationUri":"u","verificationUriComplete":"https://sally.test/connect?code=WXYZ-1234","interval":1,"expiresIn":60}`)
 		case "/api/agent/pair/poll":
-			io.WriteString(w, `{"status":"approved","token":"new-tok","device":{"id":"dev","approvedCompanyIds":["co-9"],"capability":"SCAN"},"companyName":"Riverside Hotels"}`)
+			io.WriteString(w, `{"status":"approved","token":"new-tok","device":{"id":"dev","approvedCompanyIds":["co-9"],"capability":"SCAN"},"companyName":"Riverside Hotels","approvedBy":{"id":"u1","name":"Asha Rao"}}`)
 		default:
 			io.WriteString(w, `{}`)
 		}
@@ -161,7 +161,7 @@ func TestPairingStoresTheTokenAndCompany(t *testing.T) {
 	a.opt.OpenBrowser = func(u string) error { opened = u; return nil }
 	a.pair(context.Background())
 	v := a.Snapshot()
-	if !v.Paired || v.NeedsConnect || v.CompanyName != "Riverside Hotels" || v.Pairing != nil {
+	if !v.Paired || v.NeedsConnect || v.CompanyName != "Riverside Hotels" || v.Pairing != nil || v.ApproverName != "Asha Rao" || v.PCName == "" {
 		t.Fatalf("%+v", v)
 	}
 	if opened != "https://sally.test/connect?code=WXYZ-1234" {
@@ -537,5 +537,30 @@ func TestAScanThatEndsNormallyIsNotCancelled(t *testing.T) {
 	defer sc.mu.Unlock()
 	if len(sc.deleted) != 0 || a.Snapshot().Problem != "" {
 		t.Fatalf("deleted %v problem %q", sc.deleted, a.Snapshot().Problem)
+	}
+}
+
+func TestHeartbeatNamesTheApproverWhenSallySaysWho(t *testing.T) {
+	answer := `{"heartbeatSec":10}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, answer)
+	}))
+	defer srv.Close()
+	a := pairedAgent(t, srv.URL, nil)
+	a.heartbeatOnce(context.Background())
+	if v := a.Snapshot(); v.ApproverName != "" {
+		t.Fatalf("no approver yet, got %q", v.ApproverName)
+	}
+	answer = `{"heartbeatSec":10,"approvedByName":"Asha Rao"}`
+	a.heartbeatOnce(context.Background())
+	v := a.Snapshot()
+	if v.ApproverName != "Asha Rao" || !strings.HasSuffix(v.SignedCopiesURL, "/invoices/acknowledgments") || !strings.HasPrefix(v.SignedCopiesURL, srv.URL) {
+		t.Fatalf("%+v", v)
+	}
+	// An answer without the field keeps what Sally said before.
+	answer = `{"heartbeatSec":10}`
+	a.heartbeatOnce(context.Background())
+	if a.Snapshot().ApproverName != "Asha Rao" {
+		t.Fatal("the approver should be remembered")
 	}
 }

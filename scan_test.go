@@ -295,3 +295,29 @@ func TestStatusPageCountsStacksForAnotherCompany(t *testing.T) {
 		t.Fatal("the held stacks are not on the page")
 	}
 }
+
+func TestStatusPageSaysWhoAndToday(t *testing.T) {
+	s, d := scanServer(t)
+	d.view.ApproverName, d.view.PCName = "Asha Rao", "FRONT-DESK"
+	d.view.TodayStacks, d.view.TodaySheets = 2, 61
+	d.view.SignedCopiesURL = "https://sallyerp.in/invoices/acknowledgments"
+	get := func() string {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "127.0.0.1:17777"
+		return serve(s, req).Body.String()
+	}
+	page := get()
+	for _, want := range []string{
+		"Connected as Asha Rao · FRONT-DESK",
+		"Today: 2 stacks · 61 sheets · 34 pages waiting to go up",
+		`<a href="https://sallyerp.in/invoices/acknowledgments" target="_blank" rel="noopener noreferrer">Open Signed copies</a>`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+	d.view.ApproverName = ""
+	if page := get(); strings.Contains(page, "Connected as") || !strings.Contains(page, ">FRONT-DESK</p>") {
+		t.Error("without an approver only the PC name shows")
+	}
+}

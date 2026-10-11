@@ -16,6 +16,8 @@ type local struct {
 	CompanyID   string `json:"companyId,omitempty"`
 	CompanyName string `json:"companyName,omitempty"`
 	DeviceID    string `json:"deviceId,omitempty"`
+	// ApproverName is who approved this PC in Sally, when Sally said.
+	ApproverName string `json:"approverName,omitempty"`
 
 	// Per-PC switches on the status page. Stored as "off" so that the
 	// default (absent) is on.

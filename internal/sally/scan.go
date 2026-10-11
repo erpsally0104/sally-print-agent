@@ -68,8 +68,11 @@ type Settings struct {
 
 // HeartbeatResponse is Sally's answer.
 type HeartbeatResponse struct {
-	HeartbeatSec      int       `json:"heartbeatSec"`
-	CompanyName       string    `json:"companyName"`
+	HeartbeatSec int    `json:"heartbeatSec"`
+	CompanyName  string `json:"companyName"`
+	// ApprovedByName is the approver's name (optional; a newer Sally
+	// sends it).
+	ApprovedByName    string    `json:"approvedByName,omitempty"`
 	Settings          *Settings `json:"settings"`
 	Commands          []Command `json:"commands"`
 	MinAgentVersion   *string   `json:"minAgentVersion"`

@@ -647,6 +647,10 @@ type Counts struct {
 	// Of the stacks still sending: sides in total and sides Sally holds.
 	SendingTotal int
 	SendingSent  int
+	// Today: stacks scanned today (local time) still in the outbox, and
+	// their sheets.
+	TodayStacks int
+	TodaySheets int
 	// Held: stacks scanned for another company or device. They stay on
 	// this PC and are not sent.
 	Held int
@@ -675,12 +679,17 @@ func (s *Store) Counts() Counts {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var c Counts
+	ty, tm, td := s.Now().Local().Date()
 	all := make([]*Manifest, 0, len(s.stacks))
 	for _, m := range s.stacks {
 		if !m.Complete {
 			continue
 		}
 		all = append(all, m)
+		if y, mo, d := m.Created.Local().Date(); y == ty && mo == tm && d == td {
+			c.TodayStacks++
+			c.TodaySheets += m.Sheets
+		}
 		if m.Done {
 			continue
 		}

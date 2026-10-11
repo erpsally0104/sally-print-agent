@@ -2,9 +2,11 @@ package sally
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -32,6 +34,9 @@ type Paired struct {
 	DeviceID    string
 	CompanyID   string
 	CompanyName string
+	// ApprovedBy is the name of the person who approved the PC, when the
+	// poll answer carries one (optional).
+	ApprovedBy string
 }
 
 type pollResponse struct {
@@ -43,6 +48,27 @@ type pollResponse struct {
 		Capability         string   `json:"capability"`
 	} `json:"device"`
 	CompanyName string `json:"companyName"`
+	// Optional: the approver, as a name or as {id, name}.
+	ApprovedBy     json.RawMessage `json:"approvedBy"`
+	ApprovedByName string          `json:"approvedByName"`
+}
+
+// approverName reads the optional approver from a poll answer.
+func (r *pollResponse) approverName() string {
+	if n := strings.TrimSpace(r.ApprovedByName); n != "" {
+		return n
+	}
+	var name string
+	if json.Unmarshal(r.ApprovedBy, &name) == nil {
+		return strings.TrimSpace(name)
+	}
+	var obj struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(r.ApprovedBy, &obj) == nil {
+		return strings.TrimSpace(obj.Name)
+	}
+	return ""
 }
 
 // PairError is a pairing that ended without approval.
@@ -149,6 +175,7 @@ func (c *Client) Pair(ctx context.Context, req PairStartRequest, show func(*Pair
 				DeviceID:    res.Device.ID,
 				CompanyID:   res.Device.ApprovedCompanyIDs[0],
 				CompanyName: res.CompanyName,
+				ApprovedBy:  res.approverName(),
 			}, nil
 		default:
 			return nil, &PairError{Status: res.Status}

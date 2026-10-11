@@ -151,6 +151,7 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
   .tag { display:inline-block; font-size:11px; padding:1px 6px; border-radius:99px; background:var(--line); color:var(--muted); margin-left:6px; }
   .ok { color:var(--ok); font-weight:600; }
   .warn { color:var(--warn); }
+  a { color:var(--ok); }
   code { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; }
   button { font:inherit; padding:8px 16px; border-radius:8px; border:1px solid var(--line);
            background:transparent; color:var(--fg); cursor:pointer; }
@@ -185,6 +186,8 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
       {{if .Paired}}
         <p class="files">Files into</p>
         <p class="company">{{.CompanyName}}</p>
+        {{if .ConnectedLine}}<p class="files">{{.ConnectedLine}}</p>{{end}}
+        <p class="note">{{.TodayLine}} &middot; <a href="{{.SignedCopiesURL}}" target="_blank" rel="noopener noreferrer">Open Signed copies</a></p>
       {{else}}
         <p class="company">Not connected to Sally</p>
         {{with .Pairing}}

@@ -55,6 +55,7 @@ type Agent struct {
 	up     *outbox.Uploader
 
 	statePath string
+	pcName    string
 
 	mu       sync.Mutex
 	local    local
@@ -122,6 +123,10 @@ func New(opt Options) (*Agent, error) {
 		hbEvery:   10 * time.Second,
 		hbKick:    make(chan struct{}, 1),
 		scanKick:  make(chan struct{}, 1),
+	}
+	a.pcName, _ = os.Hostname()
+	if a.pcName == "" {
+		a.pcName = "This PC"
 	}
 	l, err := loadLocal(a.statePath)
 	if err != nil {
@@ -315,11 +320,7 @@ func platform() string {
 }
 
 func (a *Agent) pair(ctx context.Context) {
-	host, _ := os.Hostname()
-	if host == "" {
-		host = "This PC"
-	}
-	req := sally.PairStartRequest{DeviceName: host, Platform: platform(), AgentVersion: a.opt.Version}
+	req := sally.PairStartRequest{DeviceName: a.pcName, Platform: platform(), AgentVersion: a.opt.Version}
 	p, err := a.client.Pair(ctx, req, func(s *sally.PairStartResponse) {
 		a.mu.Lock()
 		a.pairing = &PairingView{UserCode: s.UserCode, URL: s.VerificationURIComplete, Waiting: true}
@@ -350,6 +351,7 @@ func (a *Agent) pair(ctx context.Context) {
 	}
 	a.mu.Lock()
 	a.local.CompanyID, a.local.CompanyName, a.local.DeviceID = p.CompanyID, p.CompanyName, p.DeviceID
+	a.local.ApproverName = p.ApprovedBy
 	a.saveLocked()
 	if err := a.store.SetOwner(p.CompanyID, p.DeviceID); err != nil {
 		a.logf("stamping waiting stacks with the connection failed: %v", err)
@@ -381,7 +383,7 @@ func (a *Agent) dropToken() {
 	a.client.SetAuth("", "")
 	a.mu.Lock()
 	a.paired, a.needs = false, true
-	a.local.CompanyID, a.local.DeviceID = "", ""
+	a.local.CompanyID, a.local.DeviceID, a.local.ApproverName = "", "", ""
 	a.saveLocked()
 	_ = a.store.SetOwner("", "")
 	a.mu.Unlock()
@@ -519,6 +521,10 @@ func (a *Agent) apply(r *sally.HeartbeatResponse) {
 		a.local.CompanyName = r.CompanyName
 		changed = true
 	}
+	if n := strings.TrimSpace(r.ApprovedByName); n != "" && n != a.local.ApproverName {
+		a.local.ApproverName = short(n)
+		changed = true
+	}
 	if s := r.Settings; s != nil {
 		if s.AutoStart != nil && (a.local.AutoStart == nil || *a.local.AutoStart != *s.AutoStart) {
 			v := *s.AutoStart
@@ -582,9 +588,15 @@ type View struct {
 	Paired       bool
 	NeedsConnect bool
 	CompanyName  string
-	Denied       string
-	Offline      string
-	Pairing      *PairingView
+	// ApproverName is who approved this PC (empty when Sally has not
+	// said); PCName is this PC's name as Sally knows it.
+	ApproverName string
+	PCName       string
+	// SignedCopiesURL is Sally's Signed copies page, opened in the browser.
+	SignedCopiesURL string
+	Denied          string
+	Offline         string
+	Pairing         *PairingView
 
 	ScannerKind  string
 	ScannerName  string
@@ -608,6 +620,8 @@ type View struct {
 	SidesWaiting  int
 	SendingTotal  int
 	SendingSent   int
+	TodayStacks   int
+	TodaySheets   int
 	Recent        []outbox.LastStack
 	// Refused stacks: Sally will not take them; their pages stay here.
 	Refused []outbox.LastStack
@@ -633,14 +647,18 @@ func (a *Agent) Snapshot() View {
 		Paired:       a.paired,
 		NeedsConnect: a.needs,
 		CompanyName:  a.local.CompanyName,
-		Denied:       a.denied,
-		Offline:      a.offline,
-		ScannerKind:  a.scanner.Kind,
-		ScannerName:  a.scanner.Name,
-		ScannerState: a.scanner.State,
-		AdfLoaded:    a.scanner.AdfLoaded,
-		ScanRunning:  a.scanner.Scanning,
-		ScanSides:    a.scanner.Sides,
+		ApproverName: a.local.ApproverName,
+		PCName:       a.pcName,
+
+		SignedCopiesURL: a.client.BaseURL() + "/invoices/acknowledgments",
+		Denied:          a.denied,
+		Offline:         a.offline,
+		ScannerKind:     a.scanner.Kind,
+		ScannerName:     a.scanner.Name,
+		ScannerState:    a.scanner.State,
+		AdfLoaded:       a.scanner.AdfLoaded,
+		ScanRunning:     a.scanner.Scanning,
+		ScanSides:       a.scanner.Sides,
 
 		Paused:          paused,
 		PausedUntil:     until,
@@ -657,6 +675,8 @@ func (a *Agent) Snapshot() View {
 		SidesWaiting:  c.SidesWaiting,
 		SendingTotal:  c.SendingTotal,
 		SendingSent:   c.SendingSent,
+		TodayStacks:   c.TodayStacks,
+		TodaySheets:   c.TodaySheets,
 		Recent:        c.Recent,
 		Refused:       c.Refused,
 		Held:          c.Held,
