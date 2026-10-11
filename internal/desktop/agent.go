@@ -152,6 +152,10 @@ func New(opt Options) (*Agent, error) {
 			opt.Logf("stack %s is with Sally", stack)
 			a.kickHeartbeat()
 		},
+		OnRefused: func(stack, reason string, err error) {
+			opt.Logf("stack %s: Sally refused it (%v); its pages stay in the outbox", stack, err)
+			a.kickHeartbeat()
+		},
 	}
 
 	token, err := a.tokens.Get()
@@ -472,8 +476,16 @@ func (a *Agent) report() sally.HeartbeatRequest {
 			Stack: c.Last.Stack, Sheets: c.Last.Sheets, Sides: c.Last.Sides, At: c.Last.At, State: c.Last.State,
 		}
 	}
+	var errs []string
 	if a.problem != "" {
-		req.Error = short(a.problem)
+		errs = append(errs, a.problem)
+	}
+	if len(c.Refused) > 0 {
+		errs = append(errs, fmt.Sprintf("Sally refused %d %s, kept on this PC: %s",
+			len(c.Refused), plural(len(c.Refused), "stack", "stacks"), c.Refused[0].Refused))
+	}
+	if len(errs) > 0 {
+		req.Error = short(strings.Join(errs, "; "))
 	}
 	return req
 }
@@ -590,6 +602,8 @@ type View struct {
 	SendingTotal  int
 	SendingSent   int
 	Recent        []outbox.LastStack
+	// Refused stacks: Sally will not take them; their pages stay here.
+	Refused []outbox.LastStack
 
 	SoundsOn       bool
 	KeepCopies     bool
@@ -635,6 +649,7 @@ func (a *Agent) Snapshot() View {
 		SendingTotal:  c.SendingTotal,
 		SendingSent:   c.SendingSent,
 		Recent:        c.Recent,
+		Refused:       c.Refused,
 
 		SoundsOn:       !a.local.SoundsOff,
 		KeepCopies:     !a.local.KeepOff,

@@ -51,6 +51,9 @@ type Side struct {
 	State       string     `json:"state"`
 	ConfirmedAt *time.Time `json:"confirmedAt,omitempty"`
 	Deleted     bool       `json:"deleted,omitempty"`
+	// BadHash counts Sally's 422 answers (the bytes it got did not match
+	// the hash) for this side.
+	BadHash int `json:"badHash,omitempty"`
 }
 
 // Manifest describes one stack: everything one feeder load produced.
@@ -64,8 +67,13 @@ type Manifest struct {
 	Problem string `json:"problem,omitempty"`
 	RunID   string `json:"runId,omitempty"`
 	// Done: Sally acknowledged /done; nothing more to send.
-	Done  bool   `json:"done"`
-	Sides []Side `json:"sides"`
+	Done bool `json:"done"`
+	// Refused: Sally answered this stack in a way that can never clear
+	// (400, 404, 409, or the same side failing its hash again and again).
+	// The stack is no longer sent; its unconfirmed pages stay on the PC.
+	Refused   string     `json:"refused,omitempty"`
+	RefusedAt *time.Time `json:"refusedAt,omitempty"`
+	Sides     []Side     `json:"sides"`
 }
 
 func (m *Manifest) clone() *Manifest {
@@ -340,7 +348,7 @@ func (s *Store) Stacks() []*Manifest {
 	defer s.mu.Unlock()
 	out := make([]*Manifest, 0, len(s.stacks))
 	for _, m := range s.stacks {
-		if m.Complete && !m.Done {
+		if m.Complete && !m.Done && m.Refused == "" {
 			out = append(out, m.clone())
 		}
 	}
@@ -464,6 +472,37 @@ func (s *Store) MarkConfirmed(stack string, sheet, side int) error {
 	return nil
 }
 
+// MarkRefused stops sending a stack Sally will never take as it is. Nothing
+// is deleted: sides Sally has not confirmed stay on disk.
+func (s *Store) MarkRefused(stack, reason string) error {
+	now := s.Now().UTC()
+	if reason == "" {
+		reason = "no reason given"
+	}
+	return s.update(stack, func(m *Manifest) bool {
+		if m.Refused != "" {
+			return false
+		}
+		m.Refused, m.RefusedAt = reason, &now
+		return true
+	})
+}
+
+// NoteBadHash counts one more 422 for a side and returns the count.
+func (s *Store) NoteBadHash(stack string, sheet, side int) (int, error) {
+	n := 0
+	err := s.update(stack, func(m *Manifest) bool {
+		sd := findSide(m, sheet, side)
+		if sd == nil {
+			return false
+		}
+		sd.BadHash++
+		n = sd.BadHash
+		return true
+	})
+	return n, err
+}
+
 // MarkDone records that Sally acknowledged /done.
 func (s *Store) MarkDone(stack string) error {
 	return s.update(stack, func(m *Manifest) bool {
@@ -533,7 +572,10 @@ type Counts struct {
 	// Of the stacks still sending: sides in total and sides Sally holds.
 	SendingTotal int
 	SendingSent  int
-	Last         *LastStack
+	// Refused stacks, newest first: Sally will not take them, and their
+	// pages are kept on this PC.
+	Refused []LastStack
+	Last    *LastStack
 	// Recent stacks, newest first (for "Stacks today").
 	Recent []LastStack
 }
@@ -546,6 +588,8 @@ type LastStack struct {
 	At      time.Time
 	State   string // SAFE | SENDING | SENT
 	Problem string
+	// Refused is why Sally refused the stack, if it did.
+	Refused string
 }
 
 // Counts sums the outbox.
@@ -562,6 +606,10 @@ func (s *Store) Counts() Counts {
 		if m.Done {
 			continue
 		}
+		if m.Refused != "" {
+			c.Refused = append(c.Refused, summarise(m))
+			continue
+		}
 		c.StacksWaiting++
 		c.SendingTotal += len(m.Sides)
 		for _, sd := range m.Sides {
@@ -574,6 +622,7 @@ func (s *Store) Counts() Counts {
 		}
 	}
 	sortStacks(all)
+	sort.Slice(c.Refused, func(i, j int) bool { return c.Refused[i].At.After(c.Refused[j].At) })
 	for i := len(all) - 1; i >= 0 && len(c.Recent) < 5; i-- {
 		c.Recent = append(c.Recent, summarise(all[i]))
 	}
@@ -598,7 +647,7 @@ func summarise(m *Manifest) LastStack {
 	case confirmed > 0:
 		state = "SENDING"
 	}
-	return LastStack{Stack: m.Stack, Sheets: m.Sheets, Sides: len(m.Sides), At: m.Created, State: state, Problem: m.Problem}
+	return LastStack{Stack: m.Stack, Sheets: m.Sheets, Sides: len(m.Sides), At: m.Created, State: state, Problem: m.Problem, Refused: m.Refused}
 }
 
 // Describe is a short line about a stack for logs (counts only).

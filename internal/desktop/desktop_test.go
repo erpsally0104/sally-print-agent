@@ -381,3 +381,21 @@ func TestAJamKeepsThePagesAndStartsAgainOnceCleared(t *testing.T) {
 		t.Fatalf("sides %d, announced %v", sally.sides, sally.announced)
 	}
 }
+
+func TestHeartbeatReportsARefusedStack(t *testing.T) {
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	w, err := a.store.NewStack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := make([]byte, 100)
+	p[0], p[1] = 0xFF, 0xD8
+	w.Add(p)
+	r, _ := w.Finish("")
+	if err := a.store.MarkRefused(r.Stack, "it does not know this stack"); err != nil {
+		t.Fatal(err)
+	}
+	if e := a.report().Error; e != "Sally refused 1 stack, kept on this PC: it does not know this stack" {
+		t.Fatalf("heartbeat error %q", e)
+	}
+}

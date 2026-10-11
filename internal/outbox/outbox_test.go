@@ -197,7 +197,11 @@ type fakeSally struct {
 	maxPar   int32
 	failPuts int32 // fail this many PUTs with 500
 	announce int
-	srv      *httptest.Server
+	// refuse answers announcing these stacks with this status.
+	refuse map[string]int
+	// badHash answers every side of these runs 422.
+	badHash map[string]bool
+	srv     *httptest.Server
 }
 
 func newFakeSally(t *testing.T) *fakeSally {
@@ -246,6 +250,11 @@ func (f *fakeSally) serve(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/agent/scan/stacks":
 		f.announce++
 		stack := in["stack"].(string)
+		if code := f.refuse[stack]; code != 0 {
+			w.WriteHeader(code)
+			json.NewEncoder(w).Encode(map[string]any{"error": "That stack is not yours."})
+			return
+		}
 		run, existed := f.runs[stack]
 		if !existed {
 			run = "run-" + stack
@@ -282,6 +291,11 @@ func (f *fakeSally) serve(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"uploads": ups})
 	case len(parts) == 3 && parts[2] == "sides":
 		run := parts[1]
+		if f.badHash[run] {
+			w.WriteHeader(422)
+			json.NewEncoder(w).Encode(map[string]any{"error": "sha256 mismatch"})
+			return
+		}
 		ticket := in["ticket"].(string)
 		b, ok := f.inS3[ticket]
 		sum := sha256.Sum256(b)
@@ -450,5 +464,102 @@ func TestCountsWhileSending(t *testing.T) {
 	c := s.Counts()
 	if c.StacksWaiting != 1 || c.SidesWaiting != 4 || c.SendingTotal != 6 || c.SendingSent != 2 || c.Last.State != "SENDING" || c.BytesWaiting == 0 {
 		t.Fatalf("%+v", c)
+	}
+}
+
+func TestARefusedStackDoesNotBlockTheNext(t *testing.T) {
+	for _, code := range []int{400, 404, 409} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			f := newFakeSally(t)
+			s := openStore(t, t.TempDir())
+			now := time.Now()
+			s.Now = func() time.Time { return now }
+			stuck := scanStack(t, s, 4)
+			now = now.Add(time.Minute)
+			next := scanStack(t, s, 2)
+			f.refuse = map[string]int{stuck.Stack: code}
+
+			var refused []string
+			u := &Uploader{Store: s, API: f.client(), OnRefused: func(stack, reason string, _ error) {
+				refused = append(refused, stack+": "+reason)
+			}}
+			if err := u.SendAll(context.Background()); err != nil {
+				t.Fatalf("a stack-only refusal must not fail the round: %v", err)
+			}
+			if f.done["run-"+next.Stack] != 1 {
+				t.Fatal("the next stack should have gone up")
+			}
+			if len(refused) != 1 || refused[0] != stuck.Stack+": That stack is not yours." {
+				t.Fatalf("refused %v", refused)
+			}
+			c := s.Counts()
+			if c.StacksWaiting != 0 || len(c.Refused) != 1 || c.Refused[0].Stack != stuck.Stack || c.Refused[0].Refused == "" {
+				t.Fatalf("counts %+v", c)
+			}
+			// Never retried, never deleted, and it survives a restart.
+			before := f.announce
+			if err := u.SendAll(context.Background()); err != nil || f.announce != before {
+				t.Fatalf("a refused stack was tried again: %v", err)
+			}
+			s.Keep = func() bool { return false }
+			s.Clean()
+			for i := 1; i <= 2; i++ {
+				if _, err := s.ReadSide(stuck.Stack, i, 1); err != nil {
+					t.Fatalf("an unconfirmed side of a refused stack is gone: %v", err)
+				}
+			}
+			if c := openStore(t, s.Dir()).Counts(); len(c.Refused) != 1 {
+				t.Fatal("the refusal should be remembered")
+			}
+		})
+	}
+}
+
+func TestARepeatedBadHashRefusesOnlyThatStack(t *testing.T) {
+	f := newFakeSally(t)
+	s := openStore(t, t.TempDir())
+	now := time.Now()
+	s.Now = func() time.Time { return now }
+	bad := scanStack(t, s, 1)
+	now = now.Add(time.Minute)
+	good := scanStack(t, s, 2)
+	f.badHash = map[string]bool{"run-" + bad.Stack: true}
+	u := &Uploader{Store: s, API: f.client()}
+
+	for i := 1; i < MaxBadHash; i++ {
+		err := u.SendAll(context.Background())
+		if sally.StatusOf(err) != 422 {
+			t.Fatalf("round %d: a 422 should be retried later, got %v", i, err)
+		}
+		if f.done["run-"+good.Stack] != 1 {
+			t.Fatalf("round %d: the good stack must not wait behind the bad one", i)
+		}
+		if len(s.Counts().Refused) != 0 {
+			t.Fatalf("round %d: refused too early", i)
+		}
+	}
+	if err := u.SendAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c := s.Counts()
+	if len(c.Refused) != 1 || !strings.Contains(c.Refused[0].Refused, "did not arrive intact") {
+		t.Fatalf("counts %+v", c)
+	}
+	if _, err := s.ReadSide(bad.Stack, 1, 1); err != nil {
+		t.Fatal("the refused side must stay on disk")
+	}
+}
+
+func TestOfflineStillStopsTheRound(t *testing.T) {
+	f := newFakeSally(t)
+	s := openStore(t, t.TempDir())
+	scanStack(t, s, 2)
+	f.srv.Close()
+	u := &Uploader{Store: s, API: f.client()}
+	if err := u.SendAll(context.Background()); err == nil {
+		t.Fatal("offline must surface")
+	}
+	if c := s.Counts(); len(c.Refused) != 0 || c.StacksWaiting != 1 {
+		t.Fatalf("offline must not refuse a stack: %+v", c)
 	}
 }

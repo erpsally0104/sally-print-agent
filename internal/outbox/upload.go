@@ -3,6 +3,9 @@ package outbox
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +32,8 @@ type Uploader struct {
 	// OnError and OnSent let the agent show progress and problems.
 	OnError func(error)
 	OnSent  func(stack string)
+	// OnRefused reports a stack Sally will never take as it is.
+	OnRefused func(stack, reason string, err error)
 
 	kick chan struct{}
 	once sync.Once
@@ -98,20 +103,100 @@ func nextBackoff(d time.Duration) time.Duration {
 	return d
 }
 
-// SendAll sends every waiting stack, oldest first, and stops at the first
-// failure so the caller can back off.
+// MaxBadHash is how many times one side may come back 422 (the bytes Sally
+// got did not match the hash) before the stack counts as refused.
+const MaxBadHash = 3
+
+// SendAll sends every waiting stack, oldest first.
+//
+// A failure that concerns Sally or the connection as a whole (offline, 5xx,
+// 401, 403, 429) stops at once so the caller can back off. A failure that
+// concerns one stack only must not block the stacks behind it: a refusal
+// that can never clear (400, 404, 409, or MaxBadHash 422s for one side)
+// marks the stack refused and moves on, and a 422 below that count is
+// retried on the next round after the other stacks have had their turn.
 func (u *Uploader) SendAll(ctx context.Context) error {
 	u.init()
+	var later error
 	for _, m := range u.Store.Stacks() {
-		if err := u.sendStack(ctx, m); err != nil {
+		err := u.sendStack(ctx, m)
+		if err == nil {
+			if u.OnSent != nil {
+				u.OnSent(m.Stack)
+			}
+			continue
+		}
+		if ctx.Err() != nil {
 			return err
 		}
-		if u.OnSent != nil {
-			u.OnSent(m.Stack)
+		if reason := finalRefusal(err); reason != "" {
+			u.refuse(m.Stack, reason, err)
+			continue
 		}
+		var se *sideError
+		if errors.As(err, &se) && sally.StatusOf(err) == http.StatusUnprocessableEntity {
+			n, nerr := u.Store.NoteBadHash(m.Stack, se.sheet, se.side)
+			if nerr != nil {
+				return nerr
+			}
+			if n >= MaxBadHash {
+				u.refuse(m.Stack, fmt.Sprintf("sheet %d side %d did not arrive intact after %d tries", se.sheet, se.side, n), err)
+				continue
+			}
+			later = err
+			continue
+		}
+		return err
 	}
-	return nil
+	return later
 }
+
+func (u *Uploader) refuse(stack, reason string, err error) {
+	if merr := u.Store.MarkRefused(stack, reason); merr != nil {
+		return
+	}
+	if u.OnRefused != nil {
+		u.OnRefused(stack, reason, err)
+	}
+}
+
+// finalRefusal says why Sally will never take a stack as it is, or "" when
+// the error may clear by itself. Only Sally's own answers count: an S3
+// refusal of a presigned PUT (an expired address) clears with a new one.
+func finalRefusal(err error) string {
+	var ae *sally.APIError
+	if !errors.As(err, &ae) || ae.Path == "(upload)" {
+		return ""
+	}
+	switch ae.Status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
+	default:
+		return ""
+	}
+	msg := strings.TrimSpace(ae.Message)
+	if msg == "" || strings.HasPrefix(msg, "<") {
+		msg = map[int]string{
+			http.StatusBadRequest: "it did not accept the pages",
+			http.StatusNotFound:   "it does not know this stack",
+			http.StatusConflict:   "the stack was already started",
+		}[ae.Status]
+	}
+	if len(msg) > 120 {
+		msg = msg[:120]
+	}
+	return msg
+}
+
+// sideError ties a failure to the one side it concerns.
+type sideError struct {
+	sheet, side int
+	err         error
+}
+
+func (e *sideError) Error() string {
+	return fmt.Sprintf("sheet %d side %d: %v", e.sheet, e.side, e.err)
+}
+func (e *sideError) Unwrap() error { return e.err }
 
 func (u *Uploader) sendStack(ctx context.Context, m *Manifest) error {
 	// Announcing is idempotent: for a stack Sally already knows, it answers
@@ -211,7 +296,7 @@ func (u *Uploader) sendBatch(ctx context.Context, stack, runID string, batch []S
 			}
 			_ = u.Store.MarkUploaded(stack, sd.Sheet, sd.Side)
 			if err := u.API.ConfirmSide(ctx, runID, sd.Sheet, sd.Side, sd.SHA256, t.Ticket); err != nil {
-				fail(err)
+				fail(&sideError{sheet: sd.Sheet, side: sd.Side, err: err})
 				return
 			}
 			if err := u.Store.MarkConfirmed(stack, sd.Sheet, sd.Side); err != nil {

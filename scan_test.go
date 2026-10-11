@@ -274,3 +274,14 @@ func TestStatusPageCannotBeFramed(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusPageShowsARefusedStack(t *testing.T) {
+	s, d := scanServer(t)
+	d.view.Refused = []outbox.LastStack{{Stack: "s0", Sheets: 2, Sides: 4, Refused: "That stack is not yours."}}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "127.0.0.1:17777"
+	page := serve(s, req).Body.String()
+	if !strings.Contains(page, "Sally refused it — That stack is not yours.; its pages are kept on this PC.") {
+		t.Fatal("the refused stack is not on the page")
+	}
+}

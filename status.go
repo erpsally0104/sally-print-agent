@@ -206,6 +206,7 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
         <p class="note">{{.ReceiptWhen}} &middot; You can take the paper out.</p>
       {{end}}
       {{if .Problem}}<p class="problem">{{.Problem}}</p>{{end}}
+      {{range .RefusedRows}}<p class="problem">{{.}}</p>{{end}}
       {{if .SendingLine}}
         {{if .SendingTotal}}<div class="bar"><span style="width:{{.SendingPct}}%"></span></div>{{end}}
         <p class="note">{{.SendingLine}}</p>

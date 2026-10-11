@@ -154,7 +154,10 @@ func statusStamp(v desktop.View) string {
 	add(v.Receipt + v.Problem)
 	add(strconv.Itoa(v.StacksWaiting) + "/" + strconv.Itoa(v.SidesWaiting) + "/" + strconv.Itoa(v.SendingSent) + "/" + strconv.Itoa(v.SendingTotal))
 	for _, r := range v.Recent {
-		add(r.Stack + r.State)
+		add(r.Stack + r.State + r.Refused)
+	}
+	for _, r := range v.Refused {
+		add(r.Stack + r.Refused)
 	}
 	add(strconv.FormatBool(v.SoundsOn) + strconv.FormatBool(v.KeepCopies) + v.ScannerAddress)
 	h := fnv.New64a()
@@ -193,6 +196,8 @@ type scanCard struct {
 	AutoLine    string
 	PausedLine  string
 	Rows        []string
+	// RefusedRows are stacks Sally refused, in words.
+	RefusedRows []string
 }
 
 func clock(t time.Time) string {
@@ -283,7 +288,13 @@ func (s *server) scanCard() scanCard {
 		if r.Problem != "" {
 			row += " · stopped early"
 		}
+		if r.Refused != "" {
+			row += " · refused by Sally"
+		}
 		c.Rows = append(c.Rows, row)
+	}
+	for _, r := range v.Refused {
+		c.RefusedRows = append(c.RefusedRows, fmt.Sprintf("Stack %s: Sally refused it — %s; its pages are kept on this PC.", clock(r.At), r.Refused))
 	}
 	return c
 }
