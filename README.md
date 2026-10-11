@@ -191,11 +191,14 @@ no `golang.org/x/sys`.
 certificates, so certificate checking is switched off **for that scanner's
 client only**: the client that talks to Sally always verifies.
 
-**The scan.** One job per feeder load: A4, feeder, duplex, colour (RGB24),
-300 dpi, JPEG, with the `pwg:Version` the scanner reports (2.63 if it names
-none). `BlankPageDetectionAndRemoval` is never sent (the N4000 answers 409,
-and Sally needs the blank backs as markers). Pages come from `NextDocument`
-until 404, in scan order: sheet 1 side 1, sheet 1 side 2, sheet 2 side 1… A
+**The scan.** One job per feeder load: A4, feeder, colour (RGB24), 300 dpi,
+JPEG, with the `pwg:Version` the scanner reports (2.63 if it names none), and
+duplex when its capabilities say so (`scan:AdfDuplexInputCaps`, or an
+`scan:AdfOption` of `Duplex`). `BlankPageDetectionAndRemoval` is never sent
+(the N4000 answers 409, and Sally needs the blank backs as markers). Pages
+come from `NextDocument` until 404, in scan order: sheet 1 side 1, sheet 1
+side 2, sheet 2 side 1… for a duplex scan; a one-sided scanner's every page
+is side 1 of its own sheet. The stack's manifest records which it was. A
 page is checked to start with `FF D8` and is otherwise **never decoded or
 re-encoded**: scanners often end a JPEG a row short, which Go's decoder
 rejects, and the bytes go to Sally exactly as the scanner made them.

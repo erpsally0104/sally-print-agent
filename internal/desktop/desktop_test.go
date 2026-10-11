@@ -202,6 +202,8 @@ type fakeScanner struct {
 	jobs   int
 	jamAt  int // jam after this many pages (0 = never)
 	body   string
+	// simplex: the capabilities advertise no duplex feeder.
+	simplex bool
 }
 
 func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -209,7 +211,11 @@ func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	switch {
 	case r.URL.Path == "/eSCL/ScannerCapabilities":
-		fmt.Fprintf(w, `<scan:ScannerCapabilities xmlns:scan="%s" xmlns:pwg="%s"><pwg:Version>2.9</pwg:Version><pwg:MakeAndModel>HP ScanJet Pro N4000 snw1</pwg:MakeAndModel></scan:ScannerCapabilities>`, escl.NSScan, escl.NSPWG)
+		adf := `<scan:Adf><scan:AdfSimplexInputCaps/><scan:AdfDuplexInputCaps/><scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption></scan:AdfOptions></scan:Adf>`
+		if f.simplex {
+			adf = `<scan:Adf><scan:AdfSimplexInputCaps/><scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption></scan:AdfOptions></scan:Adf>`
+		}
+		fmt.Fprintf(w, `<scan:ScannerCapabilities xmlns:scan="%s" xmlns:pwg="%s"><pwg:Version>2.9</pwg:Version><pwg:MakeAndModel>HP ScanJet Pro N4000 snw1</pwg:MakeAndModel>%s</scan:ScannerCapabilities>`, escl.NSScan, escl.NSPWG, adf)
 	case r.URL.Path == "/eSCL/ScannerStatus":
 		adf := "ScannerAdfEmpty"
 		if f.jam {
@@ -341,7 +347,7 @@ func TestScanNowScansAStackAndSendsIt(t *testing.T) {
 	}
 	sally.mu.Unlock()
 	sc.mu.Lock()
-	if sc.jobs != 1 || !strings.Contains(sc.body, "<pwg:Version>2.9</pwg:Version>") {
+	if sc.jobs != 1 || !strings.Contains(sc.body, "<pwg:Version>2.9</pwg:Version>") || !strings.Contains(sc.body, "<scan:Duplex>true</scan:Duplex>") {
 		t.Fatalf("jobs %d body %s", sc.jobs, sc.body)
 	}
 	sc.mu.Unlock()
@@ -385,7 +391,7 @@ func TestAJamKeepsThePagesAndStartsAgainOnceCleared(t *testing.T) {
 
 func TestHeartbeatReportsARefusedStack(t *testing.T) {
 	a := pairedAgent(t, "http://127.0.0.1:1", nil)
-	w, err := a.store.NewStack()
+	w, err := a.store.NewStack(true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +421,7 @@ func TestAfterARepairStacksForTheOldCompanyAreHeld(t *testing.T) {
 	defer srv.Close()
 	a := pairedAgent(t, srv.URL, nil)
 	scan := func() string {
-		w, err := a.store.NewStack()
+		w, err := a.store.NewStack(true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -425,7 +431,7 @@ func TestAfterARepairStacksForTheOldCompanyAreHeld(t *testing.T) {
 		r, _ := w.Finish("")
 		return r.Stack
 	}
-	scan() // for co-1 / dev-1
+	scan()        // for co-1 / dev-1
 	a.dropToken() // revoked
 	unconnected := scan()
 	a.pair(context.Background())
@@ -436,5 +442,39 @@ func TestAfterARepairStacksForTheOldCompanyAreHeld(t *testing.T) {
 	}
 	if v := a.Snapshot(); v.Held != 1 {
 		t.Fatalf("held %d", v.Held)
+	}
+}
+
+func TestAOneSidedScannerScansEachPageAsItsOwnSheet(t *testing.T) {
+	sc := &fakeScanner{loaded: true, pages: 3, simplex: true}
+	scSrv := httptest.NewServer(sc)
+	defer scSrv.Close()
+	sally := newFakeSallyAll(t)
+	a := pairedAgent(t, sally.srv.URL, discoverAt(scSrv.URL))
+	a.Pause(0)
+	a.ScanNow()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	waitFor(t, "the stack to reach Sally", func() bool {
+		sally.mu.Lock()
+		defer sally.mu.Unlock()
+		return sally.done == 1
+	})
+	if v := a.Snapshot(); v.Receipt != "Got 3 sheets. Safe on this PC." {
+		t.Fatalf("receipt %q", v.Receipt)
+	}
+	sally.mu.Lock()
+	if sally.announced[0]["sheets"] != float64(3) || sally.announced[0]["sides"] != float64(3) {
+		t.Fatalf("announced %v", sally.announced)
+	}
+	sally.mu.Unlock()
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if !strings.Contains(sc.body, "<scan:Duplex>false</scan:Duplex>") {
+		t.Fatalf("a simplex scanner was asked for duplex: %s", sc.body)
 	}
 }

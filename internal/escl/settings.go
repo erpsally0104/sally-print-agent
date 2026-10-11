@@ -3,12 +3,13 @@ package escl
 import "fmt"
 
 // ScanSettings is the one scan the agent ever asks for: A4 from the feeder,
-// both sides, colour, 300 dpi, JPEG.
+// colour, 300 dpi, JPEG, both sides when the scanner can (duplex, from its
+// capabilities) and one side otherwise.
 //
 // BlankPageDetectionAndRemoval is never sent. The HP ScanJet Pro N4000
 // answers it with 409, and Sally needs the blank backs anyway: they are the
 // markers that pair a back with its front.
-func ScanSettings(version string) []byte {
+func ScanSettings(version string, duplex bool) []byte {
 	if !validVersion(version) {
 		version = DefaultVersion
 	}
@@ -26,12 +27,12 @@ func ScanSettings(version string) []byte {
     </pwg:ScanRegion>
   </pwg:ScanRegions>
   <pwg:InputSource>Feeder</pwg:InputSource>
-  <scan:Duplex>true</scan:Duplex>
+  <scan:Duplex>%t</scan:Duplex>
   <scan:ColorMode>RGB24</scan:ColorMode>
   <scan:XResolution>300</scan:XResolution>
   <scan:YResolution>300</scan:YResolution>
   <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
   <scan:DocumentFormatExt>image/jpeg</scan:DocumentFormatExt>
 </scan:ScanSettings>
-`, NSPWG, NSScan, version))
+`, NSPWG, NSScan, version, duplex))
 }

@@ -692,7 +692,8 @@ func (a *Agent) scannerLoop(ctx context.Context) {
 			}
 			continue
 		}
-		a.logf("found %s scanner %s at %s (eSCL %s)", strings.ToLower(sc.Kind), sc.Name, sc.Where, sc.Client.Version)
+		a.logf("found %s scanner %s at %s (eSCL %s, %s)", strings.ToLower(sc.Kind), sc.Name, sc.Where, sc.Client.Version,
+			map[bool]string{true: "both sides", false: "one side"}[sc.Client.Duplex])
 		a.setScanner(scannerView{Kind: sc.Kind, Name: sc.Name, State: "UNKNOWN"})
 		a.watch(ctx, sc)
 		if sc.Close != nil {
@@ -799,8 +800,8 @@ func (a *Agent) watch(ctx context.Context, sc *Scanner) {
 	}
 }
 
-// runJob scans one feeder load into one stack (two if a load passes 1000
-// sides). Every side goes to disk as it arrives. It reports whether the job
+// runJob scans one feeder load into one stack (more if a load passes 1000
+// sides, or 500 sheets one-sided). Every side goes to disk as it arrives. It reports whether the job
 // ended in a jam.
 func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) bool {
 	a.logf("scan starting (%s)", kind)
@@ -817,7 +818,8 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 		a.kickHeartbeat()
 	}()
 
-	job, err := sc.Client.StartJob(ctx, escl.ScanSettings(sc.Client.Version))
+	duplex := sc.Client.Duplex
+	job, err := sc.Client.StartJob(ctx, escl.ScanSettings(sc.Client.Version, duplex))
 	if err != nil {
 		a.fail(fmt.Sprintf("The scanner did not start: %v", err), false)
 		return false
@@ -851,12 +853,12 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 		if done {
 			break
 		}
-		if w != nil && w.Sides() >= outbox.MaxSides {
+		if w != nil && w.Full() {
 			a.finish(w, "")
 			w = nil
 		}
 		if w == nil {
-			if w, err = a.store.NewStack(); err != nil {
+			if w, err = a.store.NewStack(duplex); err != nil {
 				problem = fmt.Sprintf("Could not save pages on this PC: %v", err)
 				sc.Client.CancelJob(ctx, job)
 				break

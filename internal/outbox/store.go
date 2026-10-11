@@ -35,8 +35,11 @@ const (
 	Confirmed = "confirmed" // Sally holds it (sides answered 200/201)
 )
 
-// MaxSides is the contract's cap per stack.
-const MaxSides = 1000
+// MaxSides and MaxSheets are the contract's caps per stack.
+const (
+	MaxSides  = 1000
+	MaxSheets = 500
+)
 
 // KeepFor is how long a confirmed side stays when "keep a copy" is on.
 const KeepFor = 7 * 24 * time.Hour
@@ -66,7 +69,11 @@ type Manifest struct {
 	// the stack is sent only by that same device into that same company.
 	CompanyID string `json:"companyId,omitempty"`
 	DeviceID  string `json:"deviceId,omitempty"`
-	Sheets  int       `json:"sheets"`
+	// Duplex: the scan asked for both sides of every sheet, so sides
+	// alternate front, back. Otherwise every side is side 1 of its own
+	// sheet.
+	Duplex bool `json:"duplex"`
+	Sheets int  `json:"sheets"`
 	// Complete: scanning finished and every side is on disk.
 	Complete bool `json:"complete"`
 	// Problem: why scanning stopped early (a jam), if it did.
@@ -244,8 +251,9 @@ type StackWriter struct {
 	failed error
 }
 
-// NewStack starts a stack.
-func (s *Store) NewStack() (*StackWriter, error) {
+// NewStack starts a stack. duplex is whether the scan job asked for both
+// sides; it decides how the sides are numbered.
+func (s *Store) NewStack(duplex bool) (*StackWriter, error) {
 	now := s.Now()
 	id := newStackID(now)
 	if err := os.MkdirAll(s.stackDir(id), 0o700); err != nil {
@@ -254,7 +262,7 @@ func (s *Store) NewStack() (*StackWriter, error) {
 	s.mu.Lock()
 	company, device := s.company, s.device
 	s.mu.Unlock()
-	m := &Manifest{Stack: id, Created: now.UTC(), CompanyID: company, DeviceID: device, Sides: []Side{}}
+	m := &Manifest{Stack: id, Created: now.UTC(), CompanyID: company, DeviceID: device, Duplex: duplex, Sides: []Side{}}
 	if err := s.writeManifest(m); err != nil {
 		return nil, err
 	}
@@ -277,7 +285,26 @@ func (w *StackWriter) Sides() int {
 	return len(w.s.stacks[w.id].Sides)
 }
 
-// Add writes the next side, in scan order: sheet 1 side 1, sheet 1 side 2,
+// Full reports whether the stack can take no more sides (1000 sides, or
+// 500 sheets for a one-sided scan).
+func (w *StackWriter) Full() bool {
+	w.s.mu.Lock()
+	defer w.s.mu.Unlock()
+	m := w.s.stacks[w.id]
+	sheet, _ := numberSide(m.Duplex, len(m.Sides))
+	return len(m.Sides) >= MaxSides || sheet > MaxSheets
+}
+
+// numberSide gives the sheet and side of the idx-th side scanned (from 0).
+func numberSide(duplex bool, idx int) (sheet, side int) {
+	if duplex {
+		return idx/2 + 1, idx%2 + 1
+	}
+	return idx + 1, 1
+}
+
+// Add writes the next side, in scan order: for a duplex scan sheet 1 side
+// 1, sheet 1 side 2, sheet 2 side 1…; for a one-sided scan sheet 1 side 1,
 // sheet 2 side 1… It returns only once the side is durably on disk.
 func (w *StackWriter) Add(page []byte) error {
 	if w.failed != nil {
@@ -296,11 +323,15 @@ func (w *StackWriter) add(page []byte) error {
 	}
 	w.s.mu.Lock()
 	idx := len(w.s.stacks[w.id].Sides)
+	duplex := w.s.stacks[w.id].Duplex
 	w.s.mu.Unlock()
 	if idx >= MaxSides {
 		return fmt.Errorf("outbox: a stack holds at most %d sides", MaxSides)
 	}
-	sheet, side := idx/2+1, idx%2+1
+	sheet, side := numberSide(duplex, idx)
+	if sheet > MaxSheets {
+		return fmt.Errorf("outbox: a stack holds at most %d sheets", MaxSheets)
+	}
 	name := fmt.Sprintf("sheet-%03d-side-%d.page", sheet, side)
 	sealed, err := w.s.sealer.Seal(page)
 	if err != nil {

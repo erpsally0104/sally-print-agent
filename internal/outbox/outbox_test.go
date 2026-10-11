@@ -61,7 +61,7 @@ func openStore(t *testing.T, dir string) *Store {
 
 func TestSafeOnlyWhenEverySideIsOnDisk(t *testing.T) {
 	s := openStore(t, t.TempDir())
-	w, err := s.NewStack()
+	w, err := s.NewStack(true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestNotSafeWhenASideFailedToWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.SetOwner("co-1", "dev-1")
-	w, _ := s.NewStack()
+	w, _ := s.NewStack(true)
 	w.Add(page(0))
 	w.Add(page(1))
 	if err := w.Add(page(2)); err == nil {
@@ -131,7 +131,7 @@ func TestNotSafeWhenASideFailedToWrite(t *testing.T) {
 
 func TestNotSafeWhenAFileVanished(t *testing.T) {
 	s := openStore(t, t.TempDir())
-	w, _ := s.NewStack()
+	w, _ := s.NewStack(true)
 	w.Add(page(0))
 	os.Remove(filepath.Join(s.Dir(), w.ID(), "sheet-001-side-1.page"))
 	if r, err := w.Finish(""); err == nil || r.Safe {
@@ -141,12 +141,12 @@ func TestNotSafeWhenAFileVanished(t *testing.T) {
 
 func TestRejectsNonJPEGAndEmptyStacksVanish(t *testing.T) {
 	s := openStore(t, t.TempDir())
-	w, _ := s.NewStack()
+	w, _ := s.NewStack(true)
 	if err := w.Add([]byte("%PDF-1.7")); err == nil {
 		t.Fatal("a non-JPEG must be refused")
 	}
 	s2 := openStore(t, t.TempDir())
-	w2, _ := s2.NewStack()
+	w2, _ := s2.NewStack(true)
 	r, err := w2.Finish("")
 	if err != nil || r.Sides != 0 || r.Message() != "" {
 		t.Fatalf("%+v %v", r, err)
@@ -159,7 +159,7 @@ func TestRejectsNonJPEGAndEmptyStacksVanish(t *testing.T) {
 func TestManifestShapeAndResumeAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	s := openStore(t, dir)
-	w, _ := s.NewStack()
+	w, _ := s.NewStack(true)
 	w.Add(page(0))
 	w.Add(page(1))
 	w.Add(page(2))
@@ -331,7 +331,7 @@ func (f *fakeSally) client() *sally.Client {
 
 func scanStack(t *testing.T, s *Store, sides int) Receipt {
 	t.Helper()
-	w, err := s.NewStack()
+	w, err := s.NewStack(true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,5 +631,49 @@ func TestAStackGoesOnlyToTheCompanyAndDeviceItWasScannedFor(t *testing.T) {
 	s.Clean()
 	if _, err := s.ReadSide(old.Stack, 1, 1); err != nil {
 		t.Fatal("a held stack lost a page")
+	}
+}
+
+func TestOneSidedScanNumbersEverySideAsItsOwnSheet(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	w, err := s.NewStack(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := w.Add(page(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := w.Finish("")
+	if err != nil || r.Sheets != 3 || r.Sides != 3 || r.Message() != "Got 3 sheets. Safe on this PC." {
+		t.Fatalf("%+v %v", r, err)
+	}
+	m := s.Stacks()[0]
+	if m.Duplex {
+		t.Fatal("the manifest must record a one-sided scan")
+	}
+	for i, sd := range m.Sides {
+		if sd.Sheet != i+1 || sd.Side != 1 {
+			t.Fatalf("side %d numbered %d/%d", i, sd.Sheet, sd.Side)
+		}
+	}
+	got, err := s.ReadSide(r.Stack, 2, 1)
+	if err != nil || !bytes.Equal(got, page(1)) {
+		t.Fatal("sheet 2 should hold the second page scanned")
+	}
+
+	// A one-sided stack is full at 500 sheets, a duplex one at 1000 sides.
+	w, _ = s.NewStack(false)
+	for i := 0; i < MaxSheets; i++ {
+		if w.Full() {
+			t.Fatalf("full after %d sheets", i)
+		}
+		if err := w.Add(page(0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !w.Full() || w.Add(page(0)) == nil {
+		t.Fatal("a one-sided stack takes at most 500 sheets")
 	}
 }

@@ -126,7 +126,7 @@ func TestStreamWritesEachRequestWholeWithTheUSBHost(t *testing.T) {
 		return [][]byte{[]byte("HTTP/1.1 201 Created\r\nLocation: http://localhost:60000/eSCL/ScanJobs/77\r\nContent-Length: 0\r\n\r\n")}
 	}
 	c := NewClient(fastDoer(port), "eSCL")
-	job, err := c.StartJob(context.Background(), ScanSettings("2.9"))
+	job, err := c.StartJob(context.Background(), ScanSettings("2.9", true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestStreamWritesEachRequestWholeWithTheUSBHost(t *testing.T) {
 	if !strings.HasPrefix(w, "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: localhost:60000\r\n") {
 		t.Fatalf("request head: %q", w[:60])
 	}
-	if !strings.Contains(w, fmt.Sprintf("Content-Length: %d\r\n", len(ScanSettings("2.9")))) {
+	if !strings.Contains(w, fmt.Sprintf("Content-Length: %d\r\n", len(ScanSettings("2.9", true)))) {
 		t.Fatal("missing Content-Length")
 	}
 }
@@ -168,7 +168,7 @@ func TestStreamReadsABodyWithNoLengthUntilQuiet(t *testing.T) {
 }
 
 func TestScanSettings(t *testing.T) {
-	x := string(ScanSettings("2.9"))
+	x := string(ScanSettings("2.9", true))
 	if strings.Contains(x, "BlankPageDetection") {
 		t.Fatal("BlankPageDetectionAndRemoval must never be sent: the HP N4000 answers 409")
 	}
@@ -199,7 +199,7 @@ func TestScanSettings(t *testing.T) {
 		t.Fatalf("not well-formed: %v", err)
 	}
 	// A hostile or odd version never reaches the XML.
-	if y := string(ScanSettings("</pwg:Version><evil/>")); !strings.Contains(y, "<pwg:Version>2.63</pwg:Version>") {
+	if y := string(ScanSettings("</pwg:Version><evil/>", true)); !strings.Contains(y, "<pwg:Version>2.63</pwg:Version>") {
 		t.Fatal("an odd version must fall back to 2.63")
 	}
 }
@@ -211,6 +211,29 @@ func TestParseCapabilities(t *testing.T) {
 	}
 	if ParseCapabilities([]byte(`<x/>`)).Version != "2.63" {
 		t.Fatal("missing version must default to 2.63")
+	}
+	if c.Duplex {
+		t.Fatal("capabilities without a duplex feeder must read as simplex")
+	}
+}
+
+func TestParseCapabilitiesDuplex(t *testing.T) {
+	head := `<scan:ScannerCapabilities xmlns:pwg="` + NSPWG + `" xmlns:scan="` + NSScan + `"><pwg:Version>2.63</pwg:Version>`
+	for name, c := range map[string]struct {
+		xml  string
+		want bool
+	}{
+		"duplex input caps": {`<scan:Adf><scan:AdfSimplexInputCaps><scan:MinWidth>1</scan:MinWidth></scan:AdfSimplexInputCaps><scan:AdfDuplexInputCaps><scan:MinWidth>1</scan:MinWidth></scan:AdfDuplexInputCaps><scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption></scan:AdfOptions></scan:Adf>`, true},
+		"duplex option":     {`<scan:Adf><scan:AdfSimplexInputCaps/><scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption><scan:AdfOption>Duplex</scan:AdfOption></scan:AdfOptions></scan:Adf>`, true},
+		"simplex feeder":    {`<scan:Adf><scan:AdfSimplexInputCaps><scan:MinWidth>1</scan:MinWidth></scan:AdfSimplexInputCaps><scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption></scan:AdfOptions></scan:Adf>`, false},
+		"no feeder":         {`<scan:Platen><scan:PlatenInputCaps/></scan:Platen>`, false},
+	} {
+		if got := ParseCapabilities([]byte(head + c.xml + `</scan:ScannerCapabilities>`)).Duplex; got != c.want {
+			t.Errorf("%s: duplex %v", name, got)
+		}
+	}
+	if !strings.Contains(string(ScanSettings("2.63", false)), "<scan:Duplex>false</scan:Duplex>") {
+		t.Fatal("a simplex scanner must be asked for one side")
 	}
 }
 
@@ -286,7 +309,7 @@ func TestClientOverHTTPPullsPagesUntil404(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := NewClient(d, "")
-	job, err := c.StartJob(context.Background(), ScanSettings(c.Version))
+	job, err := c.StartJob(context.Background(), ScanSettings(c.Version, c.Duplex))
 	if err != nil {
 		t.Fatal(err)
 	}

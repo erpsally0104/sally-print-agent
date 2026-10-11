@@ -49,6 +49,9 @@ type Client struct {
 	Root string
 	// Version is what ScannerCapabilities reported (or DefaultVersion).
 	Version string
+	// Duplex is whether ScannerCapabilities said the feeder scans both
+	// sides.
+	Duplex bool
 }
 
 // NewClient returns a client rooted at root ("eSCL", "/eSCL" or "" for the
@@ -65,6 +68,13 @@ func NewClient(d Doer, root string) *Client {
 type Capabilities struct {
 	Version      string
 	MakeAndModel string
+	// Duplex: the feeder scans both sides of a sheet in one pass. The eSCL
+	// schema says so in either of two places inside scan:Adf:
+	//   <scan:AdfDuplexInputCaps>…</scan:AdfDuplexInputCaps>
+	//   <scan:AdfOptions><scan:AdfOption>Duplex</scan:AdfOption></scan:AdfOptions>
+	// (DetectPaperLoaded, the other common AdfOption, says nothing about
+	// sides.) A scanner that says neither is simplex.
+	Duplex bool
 }
 
 // Capabilities reads ScannerCapabilities and remembers the version for the
@@ -78,12 +88,12 @@ func (c *Client) Capabilities(ctx context.Context) (*Capabilities, error) {
 		return nil, &StatusError{Op: "ScannerCapabilities", Status: resp.StatusCode, Body: string(resp.Body)}
 	}
 	caps := ParseCapabilities(resp.Body)
-	c.Version = caps.Version
+	c.Version, c.Duplex = caps.Version, caps.Duplex
 	return caps, nil
 }
 
-// ParseCapabilities reads pwg:Version and pwg:MakeAndModel. A missing or odd
-// version falls back to DefaultVersion.
+// ParseCapabilities reads pwg:Version, pwg:MakeAndModel and whether the
+// feeder is duplex. A missing or odd version falls back to DefaultVersion.
 func ParseCapabilities(b []byte) *Capabilities {
 	out := &Capabilities{Version: DefaultVersion}
 	walk(b, func(local, text string) {
@@ -95,6 +105,12 @@ func ParseCapabilities(b []byte) *Capabilities {
 		case "MakeAndModel":
 			if out.MakeAndModel == "" {
 				out.MakeAndModel = text
+			}
+		case "AdfDuplexInputCaps":
+			out.Duplex = true
+		case "AdfOption":
+			if text == "Duplex" {
+				out.Duplex = true
 			}
 		}
 	})
