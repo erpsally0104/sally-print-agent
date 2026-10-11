@@ -204,6 +204,9 @@ type fakeScanner struct {
 	body   string
 	// simplex: the capabilities advertise no duplex feeder.
 	simplex bool
+	// failAt answers NextDocument 500 after this many pages (0 = never).
+	failAt  int
+	deleted []string
 }
 
 func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -234,7 +237,13 @@ func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.jobs++
 		w.Header().Set("Location", fmt.Sprintf("http://%s/eSCL/ScanJobs/%d", r.Host, f.jobs))
 		w.WriteHeader(201)
+	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/eSCL/ScanJobs/"):
+		f.deleted = append(f.deleted, r.URL.Path)
 	case strings.HasSuffix(r.URL.Path, "/NextDocument"):
+		if f.failAt > 0 && f.served == f.failAt {
+			w.WriteHeader(500)
+			return
+		}
 		if f.jamAt > 0 && f.served == f.jamAt {
 			f.jam, f.loaded = true, false
 			w.WriteHeader(404)
@@ -476,5 +485,57 @@ func TestAOneSidedScannerScansEachPageAsItsOwnSheet(t *testing.T) {
 	defer sc.mu.Unlock()
 	if !strings.Contains(sc.body, "<scan:Duplex>false</scan:Duplex>") {
 		t.Fatalf("a simplex scanner was asked for duplex: %s", sc.body)
+	}
+}
+
+func TestAScanThatStopsIsCancelledAndCalledPartial(t *testing.T) {
+	sc := &fakeScanner{loaded: true, pages: 10, failAt: 4}
+	scSrv := httptest.NewServer(sc)
+	defer scSrv.Close()
+	sally := newFakeSallyAll(t)
+	a := pairedAgent(t, sally.srv.URL, discoverAt(scSrv.URL))
+	a.Pause(0)
+	a.ScanNow()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	want := "Got 2 sheets before it stopped. They are safe on this PC. Check the feeder and the output tray: put the sheets that weren't scanned back in."
+	waitFor(t, "the partial receipt", func() bool { return a.Snapshot().Problem == want })
+	if r := a.Snapshot().Receipt; r != "" {
+		t.Fatalf("a stopped scan must not say plainly Safe: %q", r)
+	}
+	sc.mu.Lock()
+	if len(sc.deleted) != 1 || sc.deleted[0] != "/eSCL/ScanJobs/1" {
+		t.Fatalf("the job was not cancelled: %v", sc.deleted)
+	}
+	sc.mu.Unlock()
+	// What arrived still goes up.
+	waitFor(t, "the partial stack to reach Sally", func() bool {
+		sally.mu.Lock()
+		defer sally.mu.Unlock()
+		return sally.done == 1 && sally.sides == 4
+	})
+}
+
+func TestAScanThatEndsNormallyIsNotCancelled(t *testing.T) {
+	sc := &fakeScanner{loaded: true, pages: 2}
+	scSrv := httptest.NewServer(sc)
+	defer scSrv.Close()
+	sally := newFakeSallyAll(t)
+	a := pairedAgent(t, sally.srv.URL, discoverAt(scSrv.URL))
+	a.Pause(0)
+	a.ScanNow()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	waitFor(t, "the receipt", func() bool { return a.Snapshot().Receipt == "Got 1 sheet. Safe on this PC." })
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if len(sc.deleted) != 0 || a.Snapshot().Problem != "" {
+		t.Fatalf("deleted %v problem %q", sc.deleted, a.Snapshot().Problem)
 	}
 }

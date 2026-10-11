@@ -827,10 +827,32 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 
 	var w *outbox.StackWriter
 	problem := ""
+	// stopped: the job ended other than by the scanner's own "no more
+	// pages" (an error, a stall, the agent quitting). The scanner may still
+	// be feeding paper, so the job is cancelled, and the receipt says the
+	// stack is partial.
+	stopped := false
+	cancelled := false
+	cancelJob := func() {
+		if cancelled {
+			return
+		}
+		cancelled = true
+		// ctx may be over (the agent is quitting); the scanner must still
+		// be told.
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		sc.Client.CancelJob(cctx, job)
+		a.logf("scan job %s cancelled", job)
+	}
 	jam := false
 	var notReadySince time.Time
 	total := 0
-	for ctx.Err() == nil {
+	for {
+		if ctx.Err() != nil {
+			problem, stopped = "Sally Desktop stopped during the scan.", true
+			break
+		}
 		cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		page, done, err := sc.Client.NextDocument(cctx, job)
 		cancel()
@@ -839,7 +861,7 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 				notReadySince = time.Now()
 			}
 			if time.Since(notReadySince) > 2*time.Minute {
-				problem = "The scanner stopped sending pages."
+				problem, stopped = "The scanner stopped sending pages.", true
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -847,26 +869,26 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 		}
 		notReadySince = time.Time{}
 		if err != nil {
-			problem = fmt.Sprintf("The scan stopped: %v", err)
+			problem, stopped = fmt.Sprintf("The scan stopped: %v", err), true
 			break
 		}
 		if done {
 			break
 		}
 		if w != nil && w.Full() {
-			a.finish(w, "")
+			a.finish(w, "", false)
 			w = nil
 		}
 		if w == nil {
 			if w, err = a.store.NewStack(duplex); err != nil {
 				problem = fmt.Sprintf("Could not save pages on this PC: %v", err)
-				sc.Client.CancelJob(ctx, job)
+				cancelJob()
 				break
 			}
 		}
 		if err := w.Add(page); err != nil {
 			problem = fmt.Sprintf("Could not save a page on this PC: %v", err)
-			sc.Client.CancelJob(ctx, job)
+			cancelJob()
 			break
 		}
 		total++
@@ -874,26 +896,45 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 		a.scanner.Sides = total
 		a.mu.Unlock()
 	}
+	if stopped {
+		a.logf("scan stopped early: %s", problem)
+		cancelJob()
+	}
 
 	// A jam usually ends the job early, sometimes as a plain "no more
 	// pages". Ask the scanner.
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if st, err := sc.Client.Status(cctx); err == nil && (st.Jammed() || st.DoorOpen()) {
 		jam = true
 	}
 	cancel()
 
 	sheets := 0
+	saved := true
 	if w != nil {
-		r, ferr := a.finish(w, problem)
+		// A stopped stack gets no "Safe" receipt of its own: the problem
+		// line below says what was kept and what to do.
+		r, ferr := a.finish(w, problem, stopped && !jam)
 		sheets = r.Sheets
 		if ferr != nil && problem == "" {
 			problem = "Some pages could not be saved on this PC. Scan this stack again."
 		}
+		if ferr != nil {
+			saved = false
+			if stopped {
+				problem = "The scan stopped and some pages could not be saved on this PC. Scan this stack again."
+			}
+		}
 	}
-	if jam {
+	switch {
+	case jam:
 		problem = fmt.Sprintf("Paper jam. Open the cover, take out the stuck sheet and put it back on top of the stack. "+
 			"Sally kept the %d %s already scanned and sets aside anything scanned twice.", sheets, plural(sheets, "sheet", "sheets"))
+	case stopped && saved && sheets > 0:
+		problem = fmt.Sprintf("Got %d %s before it stopped. They are safe on this PC. "+
+			"Check the feeder and the output tray: put the sheets that weren't scanned back in.", sheets, plural(sheets, "sheet", "sheets"))
+	case stopped && saved:
+		problem = "The scanner stopped before sending a page. Check the feeder and the output tray: put the sheets back in."
 	}
 	if problem != "" {
 		a.fail(problem, jam)
@@ -903,10 +944,17 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 }
 
 // finish closes a stack and says "safe" only if every side is on disk.
-func (a *Agent) finish(w *outbox.StackWriter, problem string) (outbox.Receipt, error) {
+// quiet leaves the receipt to the caller (a stack the scanner cut short).
+func (a *Agent) finish(w *outbox.StackWriter, problem string, quiet bool) (outbox.Receipt, error) {
 	r, err := w.Finish(problem)
 	if err != nil {
 		a.logf("stack %s: %v", r.Stack, err)
+	}
+	if quiet {
+		a.mu.Lock()
+		a.receipt, a.receiptT = "", time.Time{}
+		a.mu.Unlock()
+		return r, err
 	}
 	if msg := r.Message(); msg != "" {
 		a.mu.Lock()
