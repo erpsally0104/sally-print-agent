@@ -172,3 +172,17 @@ func (f *folderSally) client(t *testing.T) API {
 	c.SetAuth("tok", "co-1")
 	return c
 }
+
+func TestNamesAreKeptWithinWhatSallyTakes(t *testing.T) {
+	long := strings.Repeat("x", 250) + ".pdf"
+	if got := WireName(long); len([]rune(got)) != 200 || !strings.HasSuffix(got, ".pdf") {
+		t.Fatalf("long name -> %q (%d)", got, len(got))
+	}
+	if got := WireName("  a\tb/c.jpg "); got != "a_b_c.jpg" {
+		t.Fatalf("got %q", got)
+	}
+	deep := strings.Repeat(strings.Repeat("d", 50)+"/", 8) + "last"
+	if got := wirePath(deep); len([]rune(got)) > 200 || !strings.HasSuffix(got, "/last") {
+		t.Fatalf("deep path -> %q", got)
+	}
+}

@@ -70,6 +70,12 @@ func (s *Store) NewFolderStack(fileName, folderName string, files []FolderFile) 
 	s.mu.Lock()
 	company, device := s.company, s.device
 	s.mu.Unlock()
+	if fileName != "" {
+		fileName = WireName(fileName)
+	}
+	if folderName != "" {
+		folderName = WireName(folderName)
+	}
 	m := &Manifest{
 		Stack: id, Created: now.UTC(), Kind: KindFolder, FileName: fileName, FolderName: folderName,
 		CompanyID: company, DeviceID: device, Complete: true, Sides: []Side{},
@@ -98,7 +104,7 @@ func (s *Store) NewFolderStack(fileName, folderName string, files []FolderFile) 
 		}
 		m.Sides = append(m.Sides, Side{
 			Sheet: idx, Side: 0, SHA256: sum, Size: int64(len(f.Data)), File: name, State: Pending,
-			Name: f.Name, FolderPath: f.FolderPath, ContentType: f.ContentType,
+			Name: WireName(f.Name), FolderPath: wirePath(f.FolderPath), ContentType: f.ContentType,
 		})
 	}
 	if err := s.writeManifest(m); err != nil {
@@ -157,4 +163,50 @@ func (s *Store) Stack(id string) *Manifest {
 		return m.clone()
 	}
 	return nil
+}
+
+// maxWireName is the longest name Sally takes (characters).
+const maxWireName = 200
+
+// WireName is a name as Sally takes it: no control characters or slashes,
+// trimmed, at most 200 characters (cut before the extension, which stays).
+func WireName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '/' || r == '\\' {
+			return '_'
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		name = "file"
+	}
+	rs := []rune(name)
+	if len(rs) <= maxWireName {
+		return name
+	}
+	ext := []rune(filepath.Ext(name))
+	if len(ext) > 10 {
+		ext = nil
+	}
+	return strings.TrimSpace(string(rs[:maxWireName-len(ext)])) + string(ext)
+}
+
+// wirePath is a folder drop's sub-folder as Sally takes it: each part a
+// WireName, the whole at most 200 characters (the deepest parts kept).
+func wirePath(p string) string {
+	if p == "" {
+		return ""
+	}
+	parts := strings.Split(p, "/")
+	for i := range parts {
+		parts[i] = WireName(parts[i])
+		if r := []rune(parts[i]); len(r) > 40 {
+			parts[i] = strings.TrimSpace(string(r[:40]))
+		}
+	}
+	for len(parts) > 1 && len([]rune(strings.Join(parts, "/"))) > maxWireName {
+		parts = parts[1:]
+	}
+	return strings.Join(parts, "/")
 }
