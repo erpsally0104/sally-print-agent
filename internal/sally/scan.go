@@ -44,13 +44,23 @@ type Outbox struct {
 	LastStack     *LastStack `json:"lastStack,omitempty"`
 }
 
+// WatchedFolder is the watched folder part of a heartbeat: the folder's
+// last path element only (never the full path), and counts.
+type WatchedFolder struct {
+	Name         string `json:"name"`
+	FilesWaiting int    `json:"filesWaiting"`
+	SentToday    int    `json:"sentToday"`
+	LastError    string `json:"lastError,omitempty"`
+}
+
 // HeartbeatRequest is a SCAN device's heartbeat. Counts only, never content.
 type HeartbeatRequest struct {
-	AgentVersion string   `json:"agentVersion"`
-	Scanner      *Scanner `json:"scanner,omitempty"`
-	Pause        *Pause   `json:"pause,omitempty"`
-	Outbox       *Outbox  `json:"outbox,omitempty"`
-	Error        string   `json:"error,omitempty"`
+	AgentVersion  string         `json:"agentVersion"`
+	Scanner       *Scanner       `json:"scanner,omitempty"`
+	Pause         *Pause         `json:"pause,omitempty"`
+	Outbox        *Outbox        `json:"outbox,omitempty"`
+	WatchedFolder *WatchedFolder `json:"watchedFolder,omitempty"`
+	Error         string         `json:"error,omitempty"`
 }
 
 // Command is one instruction delivered on the heartbeat.

@@ -19,6 +19,10 @@ type API interface {
 	PutObject(ctx context.Context, t sally.UploadTarget, body []byte) error
 	ConfirmSide(ctx context.Context, runID string, sheet, side int, sha256, ticket string) error
 	Done(ctx context.Context, runID string) error
+	// Watched-folder stacks (folder.go).
+	AnnounceFolder(ctx context.Context, s sally.FolderStack) (string, []string, error)
+	FileUploadURLs(ctx context.Context, runID string, files []sally.FileDecl) ([]sally.FileTarget, error)
+	ConfirmFile(ctx context.Context, runID string, f sally.FileDecl, ticket string) error
 }
 
 // Uploader sends the outbox to Sally in the background.
@@ -140,7 +144,11 @@ func (u *Uploader) SendAll(ctx context.Context) error {
 				return nerr
 			}
 			if n >= MaxBadHash {
-				u.refuse(m.Stack, fmt.Sprintf("sheet %d side %d did not arrive intact after %d tries", se.sheet, se.side, n), err)
+				what := fmt.Sprintf("sheet %d side %d", se.sheet, se.side)
+				if se.side == 0 {
+					what = fmt.Sprintf("file %d", se.sheet)
+				}
+				u.refuse(m.Stack, fmt.Sprintf("%s did not arrive intact after %d tries", what, n), err)
 				continue
 			}
 			later = err
@@ -194,11 +202,17 @@ type sideError struct {
 }
 
 func (e *sideError) Error() string {
+	if e.side == 0 {
+		return fmt.Sprintf("file %d: %v", e.sheet, e.err)
+	}
 	return fmt.Sprintf("sheet %d side %d: %v", e.sheet, e.side, e.err)
 }
 func (e *sideError) Unwrap() error { return e.err }
 
 func (u *Uploader) sendStack(ctx context.Context, m *Manifest) error {
+	if m.Kind == KindFolder {
+		return u.sendFolder(ctx, m)
+	}
 	// Announcing is idempotent: for a stack Sally already knows, it answers
 	// with the same run and the sides it already holds, which is how a
 	// restarted agent resumes without sending anything twice.

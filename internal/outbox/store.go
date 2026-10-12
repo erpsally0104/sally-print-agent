@@ -57,12 +57,25 @@ type Side struct {
 	// BadHash counts Sally's 422 answers (the bytes it got did not match
 	// the hash) for this side.
 	BadHash int `json:"badHash,omitempty"`
+
+	// A watched-folder stack's file: Sheet is its place in the stack
+	// (1…N), Side is 0, and these say what it is. Empty for a scanned side.
+	Name        string `json:"name,omitempty"`
+	FolderPath  string `json:"folderPath,omitempty"`
+	ContentType string `json:"contentType,omitempty"`
 }
 
 // Manifest describes one stack: everything one feeder load produced.
 type Manifest struct {
 	Stack   string    `json:"stack"`
 	Created time.Time `json:"created"`
+	// Kind is "" for a scanned stack and KindFolder for files taken from
+	// the watched folder (folder.go). A folder stack has no sheets: its
+	// Sides are files, and FileName (one file) or FolderName (a folder
+	// drop) names it.
+	Kind       string `json:"kind,omitempty"`
+	FileName   string `json:"fileName,omitempty"`
+	FolderName string `json:"folderName,omitempty"`
 	// CompanyID and DeviceID are the Sally company and device the stack was
 	// scanned for. A stack scanned before this PC was connected has neither
 	// and takes the first connection made; once set they never change, and
@@ -172,11 +185,22 @@ func Open(dir string, sealer Sealer) (*Store, error) {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(dir, e.Name(), "manifest.json"))
+		if errors.Is(err, os.ErrNotExist) && isFolderStackID(e.Name()) {
+			// A folder stack's manifest is written last: without it the
+			// copy never finished, and the files are still in the watched
+			// folder, to be taken again.
+			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+			continue
+		}
 		if err != nil {
 			continue
 		}
 		var m Manifest
 		if json.Unmarshal(raw, &m) != nil || m.Stack != e.Name() {
+			continue
+		}
+		if !m.Complete && m.Kind == KindFolder {
+			_ = os.RemoveAll(filepath.Join(dir, m.Stack))
 			continue
 		}
 		if !m.Complete {
@@ -660,6 +684,10 @@ type Counts struct {
 	Last    *LastStack
 	// Recent stacks, newest first (for "Stacks today").
 	Recent []LastStack
+	// FolderFilesWaiting: watched-folder files on this PC not yet with
+	// Sally (also counted in the totals above). Folder stacks are not in
+	// Today*, Recent or Last, which describe scanned stacks.
+	FolderFilesWaiting int
 }
 
 // LastStack summarises one stack.
@@ -685,8 +713,11 @@ func (s *Store) Counts() Counts {
 		if !m.Complete {
 			continue
 		}
-		all = append(all, m)
-		if y, mo, d := m.Created.Local().Date(); y == ty && mo == tm && d == td {
+		folder := m.Kind == KindFolder
+		if !folder {
+			all = append(all, m)
+		}
+		if y, mo, d := m.Created.Local().Date(); !folder && y == ty && mo == tm && d == td {
 			c.TodayStacks++
 			c.TodaySheets += m.Sheets
 		}
@@ -710,6 +741,9 @@ func (s *Store) Counts() Counts {
 			}
 			c.SidesWaiting++
 			c.BytesWaiting += sd.Size
+			if folder {
+				c.FolderFilesWaiting++
+			}
 		}
 	}
 	sortStacks(all)
