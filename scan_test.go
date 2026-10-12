@@ -26,6 +26,13 @@ func (f *fakeDesk) SetScannerAddress(a string) error {
 	f.calls = append(f.calls, "addr:"+a)
 	return nil
 }
+func (f *fakeDesk) SetWatchedFolder(p string) error {
+	if p != "" && !strings.HasPrefix(p, "/") && !strings.Contains(p, ":\\") {
+		return errBadRequest("type the folder's full path")
+	}
+	f.calls = append(f.calls, "folder:"+p)
+	return nil
+}
 
 func itoa(n int) string {
 	return map[int]string{0: "0", 15: "15", 60: "60"}[n]
@@ -78,6 +85,8 @@ func TestScannerControlsWorkFromTheStatusPage(t *testing.T) {
 		{"/scan/sounds", "on=false", "soundsoff"},
 		{"/scan/keep", "on=true", "keepon"},
 		{"/scan/scanner", "address=192.168.1.20", "addr:192.168.1.20"},
+		{"/scan/folder", "path=C%3A%5CUsers%5CAsha%5CScans", "folder:C:\\Users\\Asha\\Scans"},
+		{"/scan/folder", "path=", "folder:"},
 	} {
 		rec := serve(s, control(s, c.path, c.body))
 		if rec.Code != http.StatusOK {
@@ -319,5 +328,65 @@ func TestStatusPageSaysWhoAndToday(t *testing.T) {
 	d.view.ApproverName = ""
 	if page := get(); strings.Contains(page, "Connected as") || !strings.Contains(page, ">FRONT-DESK</p>") {
 		t.Error("without an approver only the PC name shows")
+	}
+}
+
+func TestTheWatchedFolderIsChosenOnlyFromTheStatusPage(t *testing.T) {
+	s, d := scanServer(t)
+	if rec := serve(s, control(s, "/scan/folder", "path=Scans")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a relative path: %d", rec.Code)
+	}
+	for name, mutate := range map[string]func(*http.Request){
+		"Sally itself":       func(r *http.Request) { r.Header.Set("Origin", "https://sallyerp.in") },
+		"a hostile site":     func(r *http.Request) { r.Header.Set("Origin", "https://evil.example") },
+		"DNS rebinding":      func(r *http.Request) { r.Host = "evil.example:17777"; r.Header.Del("Origin") },
+		"no page token":      func(r *http.Request) { r.Header.Del(csrfHeader) },
+		"a wrong page token": func(r *http.Request) { r.Header.Set(csrfHeader, "guess") },
+		"no local marker":    func(r *http.Request) { r.Header.Del(localHeader) },
+		"a GET":              func(r *http.Request) { r.Method = http.MethodGet },
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := control(s, "/scan/folder", "path=%2Ftmp%2Fevil")
+			mutate(req)
+			rec := serve(s, req)
+			if rec.Code == http.StatusOK {
+				t.Fatalf("accepted (%d)", rec.Code)
+			}
+			if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+				t.Fatal("the folder route must never answer CORS")
+			}
+		})
+	}
+	if len(d.calls) != 0 {
+		t.Fatalf("a refused request changed the folder: %v", d.calls)
+	}
+}
+
+func TestStatusPageShowsTheWatchedFolder(t *testing.T) {
+	s, d := scanServer(t)
+	page := func() string {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "127.0.0.1:17777"
+		return serve(s, req).Body.String()
+	}
+	if p := page(); !strings.Contains(p, "Watched folder") || !strings.Contains(p, "Choose the folder your scanner") || strings.Contains(p, `id="folder-clear"`) {
+		t.Fatal("the empty folder card is missing or offers Clear")
+	}
+	d.view.WatchedFolder = `C:\Users\Asha\Scans`
+	d.view.FolderWaiting, d.view.FolderSentToday = 2, 3
+	d.view.FolderError = "scan.pdf could not be moved to Sent to Sally yet"
+	p := page()
+	for _, want := range []string{`Watching <code>C:\Users\Asha\Scans</code>`, "2 files waiting · 3 sent today", "could not be moved", `id="folder-clear"`} {
+		if !strings.Contains(p, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+	// The status JSON carries counts, never the path.
+	req := httptest.NewRequest(http.MethodGet, "/status.json", nil)
+	req.Host = "127.0.0.1:17777"
+	req.Header.Set(localHeader, "1")
+	body := serve(s, req).Body.String()
+	if strings.Contains(body, "Asha") || !strings.Contains(body, `"sentToday":3`) {
+		t.Fatalf("status JSON %s", body)
 	}
 }

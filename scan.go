@@ -34,6 +34,7 @@ type scanDesk interface {
 	SetSounds(on bool)
 	SetKeepCopies(on bool)
 	SetScannerAddress(addr string) error
+	SetWatchedFolder(path string) error
 }
 
 func (s *server) scanRoutes(mux *http.ServeMux) {
@@ -73,6 +74,13 @@ func (s *server) scanRoutes(mux *http.ServeMux) {
 	})))
 	mux.HandleFunc("/scan/scanner", s.requireLocalControl(s.withDesk(func(d scanDesk, r *http.Request) error {
 		if err := d.SetScannerAddress(r.FormValue("address")); err != nil {
+			return errBadRequest(err.Error())
+		}
+		return nil
+	})))
+	// The watched folder: a full path, or "" to stop watching (Clear).
+	mux.HandleFunc("/scan/folder", s.requireLocalControl(s.withDesk(func(d scanDesk, r *http.Request) error {
+		if err := d.SetWatchedFolder(r.FormValue("path")); err != nil {
 			return errBadRequest(err.Error())
 		}
 		return nil
@@ -124,7 +132,12 @@ func (s *server) handleStatusJSON(w http.ResponseWriter, _ *http.Request) {
 			"stacksWaiting": v.StacksWaiting, "sidesWaiting": v.SidesWaiting,
 			"sendingTotal": v.SendingTotal, "sendingSent": v.SendingSent,
 		},
-		"held":    v.Held,
+		"held": v.Held,
+		// Counts only: the folder's path is not in this reply.
+		"watchedFolder": map[string]any{
+			"watching": v.WatchedFolder != "", "waiting": v.FolderWaiting,
+			"sentToday": v.FolderSentToday, "error": v.FolderError != "",
+		},
 		"receipt": v.Receipt,
 		"problem": v.Problem,
 		"stamp":   statusStamp(v),
@@ -163,6 +176,7 @@ func statusStamp(v desktop.View) string {
 	add(strconv.Itoa(v.Held))
 	add(v.ApproverName + v.PCName + strconv.Itoa(v.TodayStacks) + "/" + strconv.Itoa(v.TodaySheets))
 	add(strconv.FormatBool(v.SoundsOn) + strconv.FormatBool(v.KeepCopies) + v.ScannerAddress)
+	add(v.WatchedFolder + "/" + strconv.Itoa(v.FolderWaiting) + "/" + strconv.Itoa(v.FolderSentToday) + "/" + v.FolderError)
 	h := fnv.New64a()
 	h.Write(b)
 	return strconv.FormatUint(h.Sum64(), 36)
@@ -207,6 +221,10 @@ type scanCard struct {
 	ConnectedLine string
 	// TodayLine counts today's stacks and sheets and the pages waiting.
 	TodayLine string
+	// FolderLine counts the watched folder's files waiting and sent
+	// today; FolderErrorWhen is when its last problem was.
+	FolderLine      string
+	FolderErrorWhen string
 }
 
 func clock(t time.Time) string {
@@ -240,6 +258,13 @@ func (s *server) scanCard() scanCard {
 		v.SidesWaiting, pagesWord(v.SidesWaiting))
 	if !v.ReceiptAt.IsZero() {
 		c.ReceiptWhen = clock(v.ReceiptAt)
+	}
+	if v.WatchedFolder != "" {
+		c.FolderLine = fmt.Sprintf("%d %s waiting · %d sent today",
+			v.FolderWaiting, plural2(v.FolderWaiting, "file", "files"), v.FolderSentToday)
+	}
+	if v.FolderError != "" && !v.FolderErrorAt.IsZero() {
+		c.FolderErrorWhen = clock(v.FolderErrorAt)
 	}
 
 	switch {

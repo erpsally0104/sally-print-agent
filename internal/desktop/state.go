@@ -27,6 +27,10 @@ type local struct {
 	// ScannerAddress is a network scanner typed on the status page.
 	ScannerAddress string `json:"scannerAddress,omitempty"`
 
+	// WatchedFolder is the folder chosen on the status page whose files
+	// are sent to Sally by themselves (internal/watchfolder); "" for none.
+	WatchedFolder string `json:"watchedFolder,omitempty"`
+
 	// Settings last received from Sally.
 	AutoStart     *bool `json:"autoStart,omitempty"`
 	StartDelaySec int   `json:"startDelaySec,omitempty"`

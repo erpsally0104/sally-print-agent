@@ -24,6 +24,7 @@ import (
 	"github.com/sallyerp/sally-print-agent/internal/sally"
 	"github.com/sallyerp/sally-print-agent/internal/secure"
 	"github.com/sallyerp/sally-print-agent/internal/sound"
+	"github.com/sallyerp/sally-print-agent/internal/watchfolder"
 )
 
 // Options configure the agent.
@@ -53,6 +54,7 @@ type Agent struct {
 	tokens secure.TokenStore
 	store  *outbox.Store
 	up     *outbox.Uploader
+	folder *watchfolder.Watcher
 
 	statePath string
 	pcName    string
@@ -163,6 +165,26 @@ func New(opt Options) (*Agent, error) {
 		},
 	}
 
+	folder, err := watchfolder.New(watchfolder.Options{
+		Folder: func() string {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			return a.local.WatchedFolder
+		},
+		Journal: filepath.Join(opt.Dir, "watchfolder.json"),
+		Store:   store,
+		Now:     opt.Now,
+		Logf:    opt.Logf,
+		OnTaken: func() {
+			a.up.Kick()
+			a.kickHeartbeat()
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("opening the watched folder's journal: %w", err)
+	}
+	a.folder = folder
+
 	token, err := a.tokens.Get()
 	switch {
 	case err == nil && l.CompanyID != "":
@@ -199,6 +221,7 @@ func (a *Agent) Run(ctx context.Context) {
 	run(a.up.Run)
 	run(a.scannerLoop)
 	run(a.janitorLoop)
+	run(func(ctx context.Context) { a.folder.Run(ctx, watchfolder.DefaultPollEvery) })
 	wg.Wait()
 }
 
@@ -286,6 +309,41 @@ func (a *Agent) SetScannerAddress(addr string) error {
 	a.saveLocked()
 	a.mu.Unlock()
 	a.kickScanner()
+	return nil
+}
+
+// SetWatchedFolder chooses (or with "" stops watching) the folder whose
+// files are sent to Sally by themselves. It must be an existing folder,
+// given in full, and not the agent's own.
+func (a *Agent) SetWatchedFolder(path string) error {
+	path = strings.TrimSpace(path)
+	if path != "" {
+		if !filepath.IsAbs(path) {
+			return errors.New("type the folder's full path, e.g. C:\\Users\\Asha\\Documents\\Scans")
+		}
+		path = filepath.Clean(path)
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			return errors.New("that folder was not found on this PC")
+		}
+		own := filepath.Clean(a.opt.Dir)
+		if path == own || strings.HasPrefix(path, own+string(filepath.Separator)) || strings.HasPrefix(own, path+string(filepath.Separator)) {
+			return errors.New("choose a folder outside Sally Desktop's own folder")
+		}
+		if strings.EqualFold(filepath.Base(path), watchfolder.SentFolder) {
+			return errors.New("choose the folder the scans are saved in, not its Sent to Sally folder")
+		}
+	}
+	a.mu.Lock()
+	a.local.WatchedFolder = path
+	a.saveLocked()
+	a.mu.Unlock()
+	if path == "" {
+		a.logf("stopped watching a folder")
+	} else {
+		a.logf("watching the folder %s", path)
+	}
+	a.kickHeartbeat()
 	return nil
 }
 
@@ -464,6 +522,7 @@ func (a *Agent) heartbeatOnce(ctx context.Context) {
 // report builds the heartbeat body. Counts only.
 func (a *Agent) report() sally.HeartbeatRequest {
 	c := a.store.Counts()
+	fs := a.folder.Status()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	paused, until := a.local.paused(a.opt.Now())
@@ -479,6 +538,15 @@ func (a *Agent) report() sally.HeartbeatRequest {
 	req.Scanner = &sally.Scanner{
 		Kind: a.scanner.Kind, Name: a.scanner.Name, State: a.scanner.State,
 		AdfLoaded: a.scanner.AdfLoaded, Scanning: a.scanner.Scanning,
+	}
+	if fs.Folder != "" {
+		req.WatchedFolder = &sally.WatchedFolder{
+			// The folder's own name only: the full path stays on this PC.
+			Name:         short(filepath.Base(fs.Folder)),
+			FilesWaiting: fs.Waiting + c.FolderFilesWaiting,
+			SentToday:    fs.SentToday,
+			LastError:    short(fs.LastError),
+		}
 	}
 	if c.Last != nil {
 		req.Outbox.LastStack = &sally.LastStack{
@@ -633,11 +701,21 @@ type View struct {
 	ScannerAddress string
 	Encrypted      bool
 	OutboxDir      string
+
+	// The watched folder: its full path ("" when none is chosen), files
+	// waiting (in the folder, settling, or on this PC not yet with Sally),
+	// files moved to Sent to Sally today, and the last problem.
+	WatchedFolder   string
+	FolderWaiting   int
+	FolderSentToday int
+	FolderError     string
+	FolderErrorAt   time.Time
 }
 
 // Snapshot returns the current view.
 func (a *Agent) Snapshot() View {
 	c := a.store.Counts()
+	fs := a.folder.Status()
 	now := a.opt.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -686,6 +764,12 @@ func (a *Agent) Snapshot() View {
 		ScannerAddress: a.local.ScannerAddress,
 		Encrypted:      secure.Encrypts,
 		OutboxDir:      a.store.Dir(),
+
+		WatchedFolder:   fs.Folder,
+		FolderWaiting:   fs.Waiting + c.FolderFilesWaiting,
+		FolderSentToday: fs.SentToday,
+		FolderError:     fs.LastError,
+		FolderErrorAt:   fs.ErrorAt,
 	}
 	if a.pairing != nil {
 		p := *a.pairing

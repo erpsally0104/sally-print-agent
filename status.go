@@ -253,6 +253,24 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
     {{end}}
     {{end}}
   </div>
+  {{with .Scan}}{{if .Available}}
+  <div class="card" id="folder-card">
+    <h2>Watched folder</h2>
+    {{if .WatchedFolder}}
+      <p>Watching <code>{{.WatchedFolder}}</code></p>
+      <p class="note">{{.FolderLine}}</p>
+    {{else}}
+      <p class="note">Choose the folder your scanner&rsquo;s own software saves into. Each PDF or picture (JPEG, PNG, TIFF) saved there goes to Sally once it has finished saving, then moves to the <code>Sent to Sally</code> folder inside it. A folder dropped in goes as one stack.</p>
+    {{end}}
+    {{if .FolderError}}<p class="warn">{{if .FolderErrorWhen}}{{.FolderErrorWhen}} &middot; {{end}}{{.FolderError}}</p>{{end}}
+    <form class="row" id="watched-folder">
+      <input type="text" name="path" placeholder="Full path, e.g. C:\Users\you\Documents\Scans" value="{{.WatchedFolder}}" autocomplete="off">
+      <button type="submit">Watch this folder</button>
+      {{if .WatchedFolder}}<button type="button" id="folder-clear">Clear</button>{{end}}
+    </form>
+    <p class="note">Files are kept safe on this PC first, like scanned pages, and sent with this PC&rsquo;s connection to Sally.</p>
+  </div>
+  {{end}}{{end}}
   <div class="card">
     <h2>Printers</h2>
     {{if .PrinterErr}}
@@ -374,6 +392,21 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
     addr.addEventListener('submit', async function (ev) {
       ev.preventDefault();
       try { await post('/scan/scanner', { address: this.address.value }); location.reload(); }
+      catch (e) { alert(e.message); }
+    });
+  }
+  var folder = document.getElementById('watched-folder');
+  if (folder) {
+    folder.addEventListener('submit', async function (ev) {
+      ev.preventDefault();
+      try { await post('/scan/folder', { path: this.path.value }); location.reload(); }
+      catch (e) { alert(e.message); }
+    });
+  }
+  var folderClear = document.getElementById('folder-clear');
+  if (folderClear) {
+    folderClear.addEventListener('click', async function () {
+      try { await post('/scan/folder', { path: '' }); location.reload(); }
       catch (e) { alert(e.message); }
     });
   }
