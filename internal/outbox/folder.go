@@ -1,10 +1,12 @@
 package outbox
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +30,10 @@ const folderSuffix = "-f"
 
 func isFolderStackID(id string) bool { return strings.HasSuffix(id, folderSuffix) }
 
+// ErrFileChanged: a file changed (size or time) while it was copied into
+// the outbox; nothing was kept, and it is taken again once it settles.
+var ErrFileChanged = errors.New("outbox: the file changed while it was copied")
+
 // FolderFile is one file to put into a folder stack.
 type FolderFile struct {
 	// Name is the file's own name; FolderPath is the sub-folder it sits
@@ -36,13 +42,58 @@ type FolderFile struct {
 	Name        string
 	FolderPath  string
 	ContentType string
-	Data        []byte
+	// Path is the file on disk, read when it is copied (one file at a
+	// time, so a large drop never sits in memory at once). Size and MTime,
+	// when set, are what it must still be: otherwise ErrFileChanged.
+	Path  string
+	Size  int64
+	MTime time.Time
+	// Data is the file's bytes when there is no Path (tests).
+	Data []byte
 }
 
-// SHA256 is the file's hash, as the outbox records it.
+// SHA256 is the hash of Data, as the outbox records it.
 func (f FolderFile) SHA256() string {
 	sum := sha256.Sum256(f.Data)
 	return hex.EncodeToString(sum[:])
+}
+
+// read returns the file's bytes and SHA-256, streaming it from Path
+// through the hash (at most MaxFolderFileBytes are read).
+func (f FolderFile) read() ([]byte, string, error) {
+	if f.Path == "" {
+		if len(f.Data) > MaxFolderFileBytes {
+			return nil, "", fmt.Errorf("outbox: %s is larger than %d MB", f.Name, MaxFolderFileBytes>>20)
+		}
+		return f.Data, f.SHA256(), nil
+	}
+	fh, err := os.Open(f.Path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer fh.Close()
+	var buf bytes.Buffer
+	if f.Size > 0 && f.Size <= MaxFolderFileBytes {
+		buf.Grow(int(f.Size))
+	}
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(&buf, h), io.LimitReader(fh, MaxFolderFileBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("outbox: reading %s: %w", f.Name, err)
+	}
+	if n > MaxFolderFileBytes {
+		return nil, "", fmt.Errorf("outbox: %s is larger than %d MB", f.Name, MaxFolderFileBytes>>20)
+	}
+	if f.Size > 0 && n != f.Size {
+		return nil, "", ErrFileChanged
+	}
+	if !f.MTime.IsZero() {
+		info, err := fh.Stat()
+		if err != nil || info.Size() != n || !info.ModTime().Equal(f.MTime) {
+			return nil, "", ErrFileChanged
+		}
+	}
+	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // NewFolderStack copies files into the outbox as one stack, sealed and
@@ -82,20 +133,22 @@ func (s *Store) NewFolderStack(fileName, folderName string, files []FolderFile) 
 	}
 	seen := map[string]bool{}
 	for _, f := range files {
-		if len(f.Data) == 0 {
+		// One file at a time: read (hashing as it streams), seal, write,
+		// and let go of it before the next.
+		data, sum, err := f.read()
+		if err != nil {
+			return fail(err)
+		}
+		if len(data) == 0 {
 			return fail(fmt.Errorf("outbox: %s is empty", f.Name))
 		}
-		if len(f.Data) > MaxFolderFileBytes {
-			return fail(fmt.Errorf("outbox: %s is larger than %d MB", f.Name, MaxFolderFileBytes>>20))
-		}
-		sum := f.SHA256()
 		if seen[sum] {
 			continue
 		}
 		seen[sum] = true
 		idx := len(m.Sides) + 1
 		name := fmt.Sprintf("file-%03d.page", idx)
-		sealed, err := s.sealer.Seal(f.Data)
+		sealed, err := s.sealer.Seal(data)
 		if err != nil {
 			return fail(fmt.Errorf("outbox: sealing %s: %w", f.Name, err))
 		}
@@ -103,7 +156,7 @@ func (s *Store) NewFolderStack(fileName, folderName string, files []FolderFile) 
 			return fail(fmt.Errorf("outbox: writing %s: %w", f.Name, err))
 		}
 		m.Sides = append(m.Sides, Side{
-			Sheet: idx, Side: 0, SHA256: sum, Size: int64(len(f.Data)), File: name, State: Pending,
+			Sheet: idx, Side: 0, SHA256: sum, Size: int64(len(data)), File: name, State: Pending,
 			Name: WireName(f.Name), FolderPath: wirePath(f.FolderPath), ContentType: f.ContentType,
 		})
 	}
@@ -135,15 +188,16 @@ func (s *Store) makeFolderStackDir(now time.Time) (string, error) {
 	return "", errors.New("outbox: could not name a new stack")
 }
 
-// FolderStackHolding names the folder stack that already holds a file with
-// these bytes (by SHA-256), or "". A file found again in the watched folder
-// after a crash, before it was moved, is matched here and moved, not sent
-// twice.
-func (s *Store) FolderStackHolding(sha string) string {
+// FolderStackHolding names the folder stack made at or after since that
+// already holds a file with these bytes (by SHA-256), or "". It is asked
+// only about the crash window (the watcher journaled that it was copying a
+// file and stopped before journaling the move), so a file dropped again
+// later is always sent as a new stack: Sally marks true duplicates itself.
+func (s *Store) FolderStackHolding(sha string, since time.Time) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, m := range s.stacks {
-		if m.Kind != KindFolder {
+		if m.Kind != KindFolder || m.Created.Before(since) {
 			continue
 		}
 		for _, sd := range m.Sides {

@@ -309,8 +309,17 @@ func TestAFolderDroppedInIsOneRunOnceEveryFileSettles(t *testing.T) {
 func TestACrashAfterTheOutboxCopyNeitherLosesNorSendsTwice(t *testing.T) {
 	r := newRig(t)
 	p := r.write("scan.pdf", pdf("signed"))
-	// The agent copied the file into the outbox and stopped before it
-	// wrote the journal: the file is still in the folder.
+	// The agent journaled that it was copying the file, copied it into the
+	// outbox and stopped before it journaled the move: the file is still
+	// in the folder.
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.w.setCopying(copying{At: r.clock.now(), Root: r.root, Items: []item{{Src: p, Rel: "scan.pdf", Size: info.Size(), MTime: info.ModTime()}}})
+	if err := r.w.saveJournal(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.store.NewFolderStack("scan.pdf", "", []outbox.FolderFile{{Name: "scan.pdf", ContentType: "application/pdf", Data: pdf("signed")}}); err != nil {
 		t.Fatal(err)
 	}
@@ -446,5 +455,165 @@ func TestNoFolderChosenDoesNothing(t *testing.T) {
 	r.pollAfter(0)
 	if st := r.w.Status(); !strings.Contains(st.LastError, "cannot be read") {
 		t.Fatalf("last error = %q", st.LastError)
+	}
+}
+
+func TestAFileDroppedAgainIsSentAgainWhateverBecameOfTheFirst(t *testing.T) {
+	for _, end := range []string{"sending", "done", "refused"} {
+		t.Run(end, func(t *testing.T) {
+			r := newRig(t)
+			r.write("scan.pdf", pdf("signed"))
+			r.pollAfter(0)
+			r.pollAfter(6 * time.Second)
+			ms := r.stacks()
+			if len(ms) != 1 {
+				t.Fatalf("stacks = %d", len(ms))
+			}
+			first := ms[0].Stack
+			switch end {
+			case "done":
+				if err := r.store.MarkDone(first); err != nil {
+					t.Fatal(err)
+				}
+			case "refused":
+				if err := r.store.MarkRefused(first, "cancelled in Sally"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The same paper, saved into the folder again.
+			r.clock.add(time.Minute)
+			p := r.write("scan.pdf", pdf("signed"))
+			r.pollAfter(0)
+			r.pollAfter(6 * time.Second)
+			if r.taken != 2 {
+				t.Fatalf("taken = %d, want 2: the file dropped again goes up as a new stack", r.taken)
+			}
+			var again []string
+			for _, m := range r.stacks() {
+				if m.Stack != first {
+					again = append(again, m.Stack)
+				}
+			}
+			if len(again) != 1 {
+				t.Fatalf("new stacks = %v", again)
+			}
+			if exists(p) {
+				t.Fatal("the file dropped again was not moved")
+			}
+		})
+	}
+}
+
+func TestACopyingEntryForOtherFilesDoesNotMatch(t *testing.T) {
+	r := newRig(t)
+	// A stack holding these bytes exists, but the journal's "copying"
+	// entry was for a different file (another size and time).
+	p := r.write("scan.pdf", pdf("signed"))
+	r.w.setCopying(copying{At: r.clock.now(), Root: r.root, Items: []item{{Src: p, Rel: "scan.pdf", Size: 3, MTime: r.clock.now().Add(-time.Hour)}}})
+	if _, err := r.store.NewFolderStack("scan.pdf", "", []outbox.FolderFile{{Name: "scan.pdf", ContentType: "application/pdf", Data: pdf("signed")}}); err != nil {
+		t.Fatal(err)
+	}
+	r.pollAfter(0)
+	r.pollAfter(6 * time.Second)
+	if r.taken != 1 || len(r.stacks()) != 2 {
+		t.Fatalf("taken = %d, stacks = %d: not the crash window, so sent", r.taken, len(r.stacks()))
+	}
+	raw, _ := os.ReadFile(filepath.Join(r.agent, "watchfolder.json"))
+	if strings.Contains(string(raw), `"copying"`) {
+		t.Fatalf("a copying entry was left behind: %s", raw)
+	}
+}
+
+func TestAFolderDropOverTheByteCapStaysAndIsNotRetried(t *testing.T) {
+	r := newRig(t)
+	old := maxDropBytes
+	maxDropBytes = 20
+	t.Cleanup(func() { maxDropBytes = old })
+	a := r.write("Big/a.pdf", pdf("0123456789"))
+	b := r.write("Big/b.pdf", pdf("abcdefghij"))
+	r.pollAfter(0)
+	r.pollAfter(6 * time.Second)
+	if len(r.stacks()) != 0 || !exists(a) || !exists(b) {
+		t.Fatal("a drop over the cap was taken")
+	}
+	st := r.w.Status()
+	if !strings.Contains(st.LastError, "Big") || !strings.Contains(st.LastError, "Split it") {
+		t.Fatalf("last error = %q", st.LastError)
+	}
+	r.pollAfter(2 * time.Second)
+	if again := r.w.Status(); !again.ErrorAt.Equal(st.ErrorAt) {
+		t.Fatal("the same drop was looked at again")
+	}
+	// Split it: it goes.
+	if err := os.Remove(b); err != nil {
+		t.Fatal(err)
+	}
+	r.pollAfter(0)
+	r.pollAfter(6 * time.Second)
+	if len(r.stacks()) != 1 {
+		t.Fatal("the smaller drop was not taken")
+	}
+}
+
+func TestErrorsNameNoFullPath(t *testing.T) {
+	r := newRig(t)
+	r.folder = filepath.Join(r.root, "Scans", "missing")
+	r.pollAfter(0)
+	st := r.w.Status()
+	if !strings.Contains(st.LastError, "missing") || strings.Contains(st.LastError, r.root) {
+		t.Fatalf("last error = %q", st.LastError)
+	}
+}
+
+func TestALinkedSentFolderIsRefused(t *testing.T) {
+	for _, at := range []string{"sent", "day"} {
+		t.Run(at, func(t *testing.T) {
+			r := newRig(t)
+			outside := t.TempDir()
+			link := filepath.Join(r.root, SentFolder)
+			if at == "day" {
+				if err := os.MkdirAll(link, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				link = sentDir(r.root, r.clock)
+			}
+			if err := os.Symlink(outside, link); err != nil {
+				t.Skip("no symlinks here:", err)
+			}
+			p := r.write("scan.pdf", pdf("signed"))
+			r.pollAfter(0)
+			r.pollAfter(6 * time.Second)
+			if len(names(outside)) != 0 {
+				t.Fatalf("moved outside the watched folder: %v", names(outside))
+			}
+			if !exists(p) {
+				t.Fatal("the file left the folder")
+			}
+			if n := len(r.stacks()); n != 1 {
+				t.Fatalf("stacks = %d (the copy is still safe and sent)", n)
+			}
+			st := r.w.Status()
+			if !strings.Contains(st.LastError, "link") || strings.Contains(st.LastError, r.root) {
+				t.Fatalf("last error = %q", st.LastError)
+			}
+			// Once the link is gone, the move finishes.
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			r.pollAfter(2 * time.Second)
+			if exists(p) || !exists(filepath.Join(sentDir(r.root, r.clock), "scan.pdf")) {
+				t.Fatal("not moved once the link was gone")
+			}
+		})
+	}
+}
+
+func TestSafeMkdirAllRefusesAPlaceOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := safeMkdirAll(root, filepath.Join(root, "..", "elsewhere")); !errors.Is(err, errUnsafe) {
+		t.Fatalf("err = %v", err)
+	}
+	if err := safeMkdirAll(root, filepath.Join(root, SentFolder, "2026-10-12", "Monday")); err != nil {
+		t.Fatal(err)
 	}
 }

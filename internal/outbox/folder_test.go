@@ -5,13 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sallyerp/sally-print-agent/internal/sally"
 )
@@ -139,7 +142,7 @@ func TestAFolderStackGoesUpAsFilesWithNamesAndTypes(t *testing.T) {
 	if c := s.Counts(); c.StacksWaiting != 0 || c.FolderFilesWaiting != 0 {
 		t.Fatalf("after: %+v", c)
 	}
-	if hold := s.FolderStackHolding(folderFiles()[2].SHA256()); hold != id {
+	if hold := s.FolderStackHolding(folderFiles()[2].SHA256(), time.Time{}); hold != id {
 		t.Fatalf("FolderStackHolding = %q", hold)
 	}
 }
@@ -184,5 +187,48 @@ func TestNamesAreKeptWithinWhatSallyTakes(t *testing.T) {
 	deep := strings.Repeat(strings.Repeat("d", 50)+"/", 8) + "last"
 	if got := wirePath(deep); len([]rune(got)) > 200 || !strings.HasSuffix(got, "/last") {
 		t.Fatalf("deep path -> %q", got)
+	}
+}
+
+func TestAFolderFileIsReadFromDiskAndAChangeIsCaught(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	dir := t.TempDir()
+	p := dir + "/scan.pdf"
+	body := []byte("%PDF-1.7 a paper read from disk")
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.NewFolderStack("scan.pdf", "", []FolderFile{{Name: "scan.pdf", ContentType: "application/pdf", Path: p, Size: info.Size(), MTime: info.ModTime()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	m := s.Stack(id)
+	if m == nil || len(m.Sides) != 1 || m.Sides[0].SHA256 != hex.EncodeToString(sum[:]) || m.Sides[0].Size != int64(len(body)) {
+		t.Fatalf("manifest %+v", m)
+	}
+	got, err := s.ReadSide(id, 1, 0)
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("read back %q, %v", got, err)
+	}
+	// Found only by a stack made since the given time.
+	if s.FolderStackHolding(m.Sides[0].SHA256, m.Created.Add(time.Second)) != "" {
+		t.Fatal("an older stack matched")
+	}
+	if s.FolderStackHolding(m.Sides[0].SHA256, m.Created) != id {
+		t.Fatal("the stack was not found")
+	}
+	// The file is not what it was when it settled: nothing is kept.
+	before := len(s.Stacks())
+	_, err = s.NewFolderStack("scan.pdf", "", []FolderFile{{Name: "scan.pdf", ContentType: "application/pdf", Path: p, Size: info.Size() + 1, MTime: info.ModTime()}})
+	if !errors.Is(err, ErrFileChanged) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(s.Stacks()) != before {
+		t.Fatal("a stack was kept for a changed file")
 	}
 }

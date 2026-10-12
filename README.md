@@ -248,8 +248,13 @@ shows the folder, files waiting, files sent today and the last problem.
   (`~$*`, `*.tmp`, `*.part`, `.*`), empty files and everything else are left
   where they are; a file over 100 MB is left there with a note.
 - A file directly in the folder is one stack. A sub-folder dropped in is one
-  stack for all of its files (up to 500), sent once every file in it has
-  settled. The `Sent to Sally` folder itself is never looked into.
+  stack for all of its files (up to 500, and up to 500 MB in all; a larger
+  one stays where it is with a note and is not read again until it
+  changes), sent once every file in it has settled. Files are copied one at
+  a time, streamed through SHA-256, so a large drop never sits in memory.
+  The `Sent to Sally` folder itself is never looked into; it and the
+  folders under it are refused when they are a link or junction leading
+  elsewhere.
 - Taking a stack: its files are first copied into the **same outbox** as
   scanned pages (sealed, fsynced, hashed: "safe on this PC" the same way, and
   sent with the same device token and uploader), then a journal
@@ -259,9 +264,13 @@ shows the folder, files waiting, files sent today and the last problem.
   own name there). A name already there gets ` (2)`, ` (3)`…; nothing is
   ever overwritten. Files that are not sent stay in the dropped folder.
 - Restarts: pending moves in the journal are finished on start (a file whose
-  size or time changed since is a new file and is taken as one). A file
-  found in the folder whose bytes an outbox folder stack already holds (the
-  agent stopped after copying, before journaling) is moved, not sent again.
+  size or time changed since is a new file and is taken as one). The
+  journal also notes a stack before it is copied: when the agent stopped
+  after copying, before journaling the move, the files it was copying are
+  matched (by SHA-256) with the stack made since then and moved, not sent
+  again. That is the only match: a file dropped in again later (after a run
+  was cancelled or refused, say) is sent as a new stack, and Sally marks
+  true duplicates itself.
   A move Windows refuses because the scanner's software still holds the file
   is tried again on the next poll; the file is never sent twice meanwhile.
 - On the wire a folder stack is announced with `kind: "FOLDER"`, its file

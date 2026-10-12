@@ -25,19 +25,34 @@
 //     drop into a sub-folder of its own name there). A name already there
 //     gets " (2)", " (3)"…: nothing is ever overwritten.
 //
-// After a crash between 2 and 3 the journal finishes the moves on start. A
-// crash between 1 and 2 leaves the files in the folder with their copy in
-// the outbox: a file whose bytes (SHA-256) an outbox folder stack already
-// holds is moved, not sent again. A move that fails (on Windows, a file the
+// Before step 1 the journal records that the run is being copied. After a
+// crash between 2 and 3 the journal finishes the moves on start. A crash
+// between 1 and 2 leaves the files in the folder with their copy in the
+// outbox: the journal still says "copying" for exactly these files, so a
+// folder stack made since then that holds their bytes (SHA-256) is moved
+// to, not sent again. Only then: a file dropped again later (after a run
+// was cancelled or refused, say) is always sent as a new stack, and Sally
+// marks true duplicates itself. A move that fails (on Windows, a file the
 // scanner's software still holds open) is tried again on the next poll.
+//
+// Files are read one at a time, streamed through SHA-256 into the outbox,
+// so a large drop never sits in memory; a drop over maxDropBytes in all is
+// not taken (the status page says so; it is not retried until it changes).
+//
+// "Sent to Sally" and every folder under it are made one step at a time:
+// a link, junction or other reparse point leading elsewhere is refused, and nothing is
+// ever moved to a place that resolves outside the watched folder.
 package watchfolder
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,10 +76,13 @@ const (
 	maxDepth = 8
 )
 
+// maxDropBytes caps a folder drop's files in all (tests lower it).
+var maxDropBytes int64 = 500 << 20
+
 // Store is the part of the outbox the watcher uses.
 type Store interface {
 	NewFolderStack(fileName, folderName string, files []outbox.FolderFile) (string, error)
-	FolderStackHolding(sha string) string
+	FolderStackHolding(sha string, since time.Time) string
 }
 
 // Options configure a Watcher.
@@ -133,6 +151,16 @@ type journal struct {
 	SentToday int    `json:"sentToday"`
 	// Pending moves: runs copied into the outbox, not yet (all) moved.
 	Pending []move `json:"pending"`
+	// Copying: runs being copied into the outbox, not yet journaled as a
+	// move. One left here after a restart is the crash window.
+	Copying []copying `json:"copying,omitempty"`
+}
+
+type copying struct {
+	At    time.Time `json:"at"`
+	Root  string    `json:"root"`
+	Drop  string    `json:"drop,omitempty"`
+	Items []item    `json:"items"`
 }
 
 type move struct {
@@ -141,7 +169,7 @@ type move struct {
 	// single file).
 	Root string `json:"root"`
 	Drop string `json:"drop,omitempty"`
-	// Dest is the folder the files go into.
+	// Dest is the folder the files go into ("" until it could be made).
 	Dest  string `json:"dest"`
 	Items []item `json:"items"`
 }
@@ -177,8 +205,8 @@ func New(opt Options) (*Watcher, error) {
 		return nil, err
 	default:
 		if err := json.Unmarshal(raw, &w.j); err != nil {
-			// A damaged journal must not stop the watcher; the hash check
-			// still keeps a file in the outbox from being sent twice.
+			// A damaged journal must not stop the watcher; at worst a file
+			// already copied is sent again, and Sally marks it a duplicate.
 			opt.Logf("watched folder: the journal could not be read (%v); starting afresh", err)
 			w.j = journal{}
 		}
@@ -263,6 +291,7 @@ func (w *Watcher) Poll() {
 	defer func() { w.publish(waiting) }()
 	w.rollDay()
 	w.finishMoves()
+	w.pruneCopying()
 
 	folder := w.opt.Folder()
 	if folder != w.folder {
@@ -277,7 +306,8 @@ func (w *Watcher) Poll() {
 	}
 	entries, err := os.ReadDir(folder)
 	if err != nil {
-		w.setErr("the folder %s cannot be read: %v", folder, err)
+		w.opt.Logf("watched folder: %s cannot be read: %v", folder, err)
+		w.setErr("the folder %s cannot be read: %s", filepath.Base(folder), shortErr(err))
 		return
 	}
 	pending := w.pendingSources()
@@ -300,7 +330,8 @@ func (w *Watcher) Poll() {
 			}
 			files, sig, err := w.readDrop(path)
 			if err != nil {
-				w.setErr("the folder %s cannot be read: %v", name, err)
+				w.opt.Logf("watched folder: %s cannot be read: %v", path, err)
+				w.setErr("the folder %s cannot be read: %s", name, shortErr(err))
 				continue
 			}
 			if len(files) == 0 {
@@ -315,6 +346,14 @@ func (w *Watcher) Poll() {
 				if w.skip[path] != sig {
 					w.skip[path] = sig
 					w.setErr("the folder %s has %d files; Sally takes at most %d at once. Split it into smaller folders.", name, len(files), outbox.MaxFolderFiles)
+				}
+				continue
+			}
+			if total := dropBytes(files); total > maxDropBytes {
+				// Left in place, and not read again until it changes.
+				if w.skip[path] != sig {
+					w.skip[path] = sig
+					w.setErr("the folder %s holds %d MB; Sally takes at most %d MB at once. Split it into smaller folders.", name, (total+(1<<20)-1)>>20, maxDropBytes>>20)
 				}
 				continue
 			}
@@ -357,6 +396,14 @@ func (w *Watcher) settled(path, sig string, now time.Time) bool {
 		return false
 	}
 	return now.Sub(o.since) >= w.opt.Settle
+}
+
+func dropBytes(files []candidateFile) int64 {
+	var n int64
+	for _, f := range files {
+		n += f.size
+	}
+	return n
 }
 
 func sigOf(info os.FileInfo) string {
@@ -407,6 +454,7 @@ type candidateFile struct {
 	path, name, folderPath string
 	size                   int64
 	mtime                  time.Time
+	contentType            string
 }
 
 // candidate decides whether a file would be sent: a PDF or picture by its
@@ -483,105 +531,249 @@ func (w *Watcher) readDrop(dir string) ([]candidateFile, string, error) {
 	return files, strings.Join(sig, "\n"), nil
 }
 
-// take sends one settled run: copy into the outbox (or find it there
-// already), journal, move. It reports whether the run left the folder's
-// waiting list (taken, or found already taken).
+// take sends one settled run: journal that it is being copied, copy it
+// into the outbox one file at a time (or, after a crash in that window,
+// find the copy there), journal the move, move. It reports whether the run
+// left the folder's waiting list.
 func (w *Watcher) take(root, drop string, files []candidateFile) bool {
 	label := filepath.Base(drop)
 	if drop == "" {
 		label = files[0].name
 	}
-	read := make([]outbox.FolderFile, 0, len(files))
+	keep := make([]candidateFile, 0, len(files))
 	for _, f := range files {
-		data, err := os.ReadFile(f.path)
+		ct, err := sniffFile(f)
+		if errors.Is(err, outbox.ErrFileChanged) {
+			// It changed since it settled: wait for it to settle again.
+			w.unsettle(drop, f.path)
+			return false
+		}
 		if err != nil {
 			// Often the scanner's software still holds it: next poll.
 			w.opt.Logf("watched folder: %s cannot be read yet: %v", f.name, err)
 			return false
 		}
-		info, err := os.Stat(f.path)
-		if err != nil || info.Size() != f.size || !info.ModTime().Equal(f.mtime) || int64(len(data)) != f.size {
-			// It changed while being read: wait for it to settle again.
-			delete(w.seen, f.path)
-			if drop != "" {
-				delete(w.seen, drop)
-			}
-			return false
-		}
-		ct := sniff(data)
 		if ct == "" {
-			w.skip[f.path] = sigOf(info)
+			w.skip[f.path] = fmt.Sprintf("%d|%d", f.size, f.mtime.UnixNano())
 			w.setErr("%s is not a PDF or a picture inside; it stays in the folder", f.name)
 			continue
 		}
-		read = append(read, outbox.FolderFile{Name: f.name, FolderPath: f.folderPath, ContentType: ct, Data: data})
+		f.contentType = ct
+		keep = append(keep, f)
 	}
-	if len(read) == 0 {
+	if len(keep) == 0 {
 		return false
 	}
-
-	// Already in the outbox (the agent stopped after copying, before it
-	// could journal the move)? Then move, do not send again.
-	stack := ""
-	for _, f := range read {
-		id := w.opt.Store.FolderStackHolding(f.SHA256())
-		if id == "" {
-			stack = ""
-			break
-		}
-		if stack == "" {
-			stack = id
-		}
+	items := make([]item, len(keep))
+	for i, f := range keep {
+		items[i] = item{Src: f.path, Rel: joinRel(f.folderPath, f.name), Size: f.size, MTime: f.mtime}
 	}
-	found := stack != ""
+
+	stack, found := w.copiedBeforeACrash(root, drop, keep, items)
 	if !found {
+		w.setCopying(copying{At: w.opt.Now(), Root: root, Drop: drop, Items: items})
+		if err := w.saveJournal(); err != nil {
+			w.dropCopying(root, drop, items)
+			w.opt.Logf("watched folder: writing the journal failed: %v", err)
+			w.setErr("could not write the journal: %s", shortErr(err))
+			return false
+		}
 		fileName, folderName := "", ""
 		if drop == "" {
-			fileName = read[0].Name
+			fileName = keep[0].name
 		} else {
 			folderName = label
 		}
-		id, err := w.opt.Store.NewFolderStack(fileName, folderName, read)
+		in := make([]outbox.FolderFile, len(keep))
+		for i, f := range keep {
+			in[i] = outbox.FolderFile{Name: f.name, FolderPath: f.folderPath, ContentType: f.contentType, Path: f.path, Size: f.size, MTime: f.mtime}
+		}
+		id, err := w.opt.Store.NewFolderStack(fileName, folderName, in)
 		if err != nil {
-			w.setErr("%s could not be kept safe on this PC: %v", label, err)
+			w.dropCopying(root, drop, items)
+			_ = w.saveJournal()
+			if errors.Is(err, outbox.ErrFileChanged) {
+				w.unsettle(drop, "")
+				for _, f := range keep {
+					delete(w.seen, f.path)
+				}
+				return false
+			}
+			w.opt.Logf("watched folder: %s could not be kept safe on this PC: %v", label, err)
+			w.setErr("%s could not be kept safe on this PC: %s", label, shortErr(err))
 			return false
 		}
 		stack = id
-		w.opt.Logf("watched folder: %s is safe on this PC as stack %s (%d %s)", label, stack, len(read), plural(len(read), "file", "files"))
+		w.opt.Logf("watched folder: %s is safe on this PC as stack %s (%d %s)", label, stack, len(keep), plural(len(keep), "file", "files"))
 	} else {
-		w.opt.Logf("watched folder: %s is already in the outbox (stack %s); moving it, not sending it again", label, stack)
+		w.opt.Logf("watched folder: %s was copied into the outbox before the agent stopped (stack %s); moving it, not sending it again", label, stack)
 	}
 
-	mv := move{Stack: stack, Root: root, Drop: drop}
-	dest, err := w.destFor(root, drop)
-	if err != nil {
-		w.setErr("could not make the %s folder: %v", SentFolder, err)
-		// The copy is safe; the hash check moves the files on a later poll.
-		return true
-	}
-	mv.Dest = dest
-	sent := map[string]bool{}
-	for _, f := range read {
-		sent[joinRel(f.FolderPath, f.Name)] = true
-	}
-	for _, f := range files {
-		rel := joinRel(f.folderPath, f.name)
-		if !sent[rel] {
-			continue // not a PDF or picture inside: it stays
-		}
-		mv.Items = append(mv.Items, item{Src: f.path, Rel: rel, Size: f.size, MTime: f.mtime})
-	}
-	w.j.Pending = append(w.j.Pending, mv)
+	// Journal the move and forget the copy, in one write. Should it fail,
+	// the "copying" entry on disk still finds this copy next time.
+	before := append([]copying(nil), w.j.Copying...)
+	w.dropCopying(root, drop, items)
+	w.j.Pending = append(w.j.Pending, move{Stack: stack, Root: root, Drop: drop, Items: items})
 	if err := w.saveJournal(); err != nil {
 		w.j.Pending = w.j.Pending[:len(w.j.Pending)-1]
-		w.setErr("could not write the journal: %v", err)
-		return true
+		w.j.Copying = before
+		w.opt.Logf("watched folder: writing the journal failed: %v", err)
+		w.setErr("could not write the journal: %s", shortErr(err))
+		w.unsettle(drop, items[0].Src)
+		return false
 	}
 	if !found && w.opt.OnTaken != nil {
 		w.opt.OnTaken()
 	}
 	w.finishMoves()
 	return true
+}
+
+// unsettle forgets that a run had settled, so it is looked at afresh.
+func (w *Watcher) unsettle(drop, path string) {
+	if path != "" {
+		delete(w.seen, path)
+	}
+	if drop != "" {
+		delete(w.seen, drop)
+	}
+}
+
+// copiedBeforeACrash finds the crash window: the journal says these very
+// files (same paths, sizes, times) were being copied, and a folder stack
+// made since then holds all their bytes. Then that stack is the run.
+func (w *Watcher) copiedBeforeACrash(root, drop string, keep []candidateFile, items []item) (string, bool) {
+	i := w.findCopying(root, drop, items)
+	if i < 0 {
+		return "", false
+	}
+	since := w.j.Copying[i].At.Add(-time.Second)
+	stack := ""
+	for _, f := range keep {
+		sum, err := hashFile(f)
+		if err != nil {
+			return "", false
+		}
+		id := w.opt.Store.FolderStackHolding(sum, since)
+		if id == "" || (stack != "" && id != stack) {
+			return "", false
+		}
+		stack = id
+	}
+	return stack, stack != ""
+}
+
+// findCopying is the index of the "copying" entry for exactly these files,
+// or -1.
+func (w *Watcher) findCopying(root, drop string, items []item) int {
+	for i, c := range w.j.Copying {
+		if c.Root != root || c.Drop != drop || len(c.Items) != len(items) {
+			continue
+		}
+		same := true
+		for k := range items {
+			a, b := items[k], c.Items[k]
+			if a.Src != b.Src || a.Size != b.Size || !a.MTime.Equal(b.MTime) {
+				same = false
+				break
+			}
+		}
+		if same {
+			return i
+		}
+	}
+	return -1
+}
+
+// sameRun: a "copying" entry for the same drop (or the same single file).
+func sameRun(c copying, root, drop string, items []item) bool {
+	if c.Root != root || c.Drop != drop {
+		return false
+	}
+	if drop != "" {
+		return true
+	}
+	return len(c.Items) > 0 && len(items) > 0 && c.Items[0].Src == items[0].Src
+}
+
+func (w *Watcher) setCopying(c copying) {
+	w.dropCopying(c.Root, c.Drop, c.Items)
+	w.j.Copying = append(w.j.Copying, c)
+}
+
+func (w *Watcher) dropCopying(root, drop string, items []item) {
+	kept := w.j.Copying[:0]
+	for _, c := range w.j.Copying {
+		if !sameRun(c, root, drop, items) {
+			kept = append(kept, c)
+		}
+	}
+	w.j.Copying = kept
+}
+
+// pruneCopying forgets "copying" entries none of whose files is still in
+// place as it was: they can never be the crash window again.
+func (w *Watcher) pruneCopying() {
+	if len(w.j.Copying) == 0 {
+		return
+	}
+	kept := w.j.Copying[:0]
+	for _, c := range w.j.Copying {
+		alive := false
+		for _, it := range c.Items {
+			if info, err := os.Stat(it.Src); err == nil && info.Size() == it.Size && info.ModTime().Equal(it.MTime) {
+				alive = true
+				break
+			}
+		}
+		if alive {
+			kept = append(kept, c)
+		}
+	}
+	if len(kept) != len(w.j.Copying) {
+		w.j.Copying = kept
+		if err := w.saveJournal(); err != nil {
+			w.opt.Logf("watched folder: saving the journal failed: %v", err)
+		}
+	}
+}
+
+// sniffFile reads a file's first bytes (it must still be as it settled)
+// and names its type, or "" when it is not a PDF or picture inside.
+func sniffFile(f candidateFile) (string, error) {
+	fh, err := os.Open(f.path)
+	if err != nil {
+		return "", err
+	}
+	defer fh.Close()
+	info, err := fh.Stat()
+	if err != nil {
+		return "", err
+	}
+	if info.Size() != f.size || !info.ModTime().Equal(f.mtime) {
+		return "", outbox.ErrFileChanged
+	}
+	head := make([]byte, 16)
+	n, _ := io.ReadFull(fh, head)
+	return sniff(head[:n]), nil
+}
+
+// hashFile streams a file through SHA-256 (never all in memory).
+func hashFile(f candidateFile) (string, error) {
+	fh, err := os.Open(f.path)
+	if err != nil {
+		return "", err
+	}
+	defer fh.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(fh, outbox.MaxFolderFileBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if n != f.size {
+		return "", outbox.ErrFileChanged
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func joinRel(folderPath, name string) string {
@@ -595,7 +787,7 @@ func joinRel(folderPath, name string) string {
 // sub-folder of the drop's name there (" (2)"… when that name is taken).
 func (w *Watcher) destFor(root, drop string) (string, error) {
 	day := filepath.Join(root, SentFolder, w.opt.Now().Local().Format("2006-01-02"))
-	if err := os.MkdirAll(day, 0o755); err != nil {
+	if err := safeMkdirAll(root, day); err != nil {
 		return "", err
 	}
 	if drop == "" {
@@ -613,6 +805,92 @@ func (w *Watcher) destFor(root, drop string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("too many folders named %s", base)
+}
+
+// errUnsafe: the way into Sent to Sally passes a link, junction or other
+// reparse point, or leads outside the watched folder.
+var errUnsafe = errors.New("the Sent to Sally folder is a link or leads outside the watched folder")
+
+// safeMkdirAll makes dir, which must be inside root, one folder at a time.
+// Each folder on the way is looked at without following links: a link, a
+// junction (any reparse point) or a file there is refused. Last, the
+// folder, resolved, must still be inside root, resolved.
+func safeMkdirAll(root, dir string) error {
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || escapes(rel) {
+		return errUnsafe
+	}
+	cur := root
+	if rel != "." {
+		for _, part := range strings.Split(rel, string(filepath.Separator)) {
+			if part == "" || part == "." {
+				continue
+			}
+			cur = filepath.Join(cur, part)
+			info, err := os.Lstat(cur)
+			if errors.Is(err, os.ErrNotExist) {
+				if err := os.Mkdir(cur, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+					return err
+				}
+				info, err = os.Lstat(cur)
+			}
+			if err != nil {
+				return err
+			}
+			if !plainDir(cur, info) {
+				return fmt.Errorf("%w (%s)", errUnsafe, part)
+			}
+		}
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	if r, err := filepath.Rel(realRoot, realDir); err != nil || escapes(r) {
+		return errUnsafe
+	}
+	return nil
+}
+
+func escapes(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel)
+}
+
+// plainDir: a folder, not a link, junction or other reparse point that
+// leads somewhere else.
+func plainDir(path string, info os.FileInfo) bool {
+	return info.IsDir() && !isLink(path, info)
+}
+
+// shortErr is an error for the status page and the heartbeat: paths in it
+// cut to their last part (the full error stays in the local log), and
+// short.
+func shortErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	var pe *os.PathError
+	if errors.As(err, &pe) && pe.Path != "" {
+		msg = strings.ReplaceAll(msg, pe.Path, filepath.Base(pe.Path))
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		if le.Old != "" {
+			msg = strings.ReplaceAll(msg, le.Old, filepath.Base(le.Old))
+		}
+		if le.New != "" {
+			msg = strings.ReplaceAll(msg, le.New, filepath.Base(le.New))
+		}
+	}
+	if r := []rune(msg); len(r) > 160 {
+		msg = string(r[:160]) + "…"
+	}
+	return msg
 }
 
 // numbered is name for n == 1, else "name (n)" (before the extension for
@@ -682,8 +960,23 @@ func (w *Watcher) finishMoves() {
 				it.Done, changed = true, true
 				continue
 			}
-			if err := moveInto(it.Src, filepath.Join(m.Dest, filepath.FromSlash(it.Rel))); err != nil {
+			if m.Dest == "" {
+				dest, err := w.destFor(m.Root, m.Drop)
+				if err != nil {
+					left++
+					w.opt.Logf("watched folder: making the %s folder failed: %v", SentFolder, err)
+					w.setErr("could not make the %s folder: %s", SentFolder, shortErr(err))
+					break
+				}
+				m.Dest, changed = dest, true
+			}
+			if err := moveInto(m.Root, it.Src, filepath.Join(m.Dest, filepath.FromSlash(it.Rel))); err != nil {
 				left++
+				if errors.Is(err, errUnsafe) {
+					w.opt.Logf("watched folder: %s not moved: %v", it.Src, err)
+					w.setErr("%s was not moved: %s", filepath.Base(it.Src), shortErr(err))
+					continue
+				}
 				w.setErr("%s could not be moved to %s yet (it may be open in another program); trying again", filepath.Base(it.Src), SentFolder)
 				continue
 			}
@@ -711,9 +1004,10 @@ func (w *Watcher) finishMoves() {
 var rename = os.Rename
 
 // moveInto renames src to dst, or to "dst (2)", "dst (3)"… when a file of
-// that name is already there. It never overwrites.
-func moveInto(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+// that name is already there. It never overwrites, and dst's folder (made
+// safely under root) never leads outside root.
+func moveInto(root, src, dst string) error {
+	if err := safeMkdirAll(root, filepath.Dir(dst)); err != nil {
 		return err
 	}
 	name := filepath.Base(dst)
