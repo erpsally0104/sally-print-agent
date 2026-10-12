@@ -120,6 +120,7 @@ through in full at the top of [`security.go`](security.go). In short:
 | Printer names resolved against the enumerated list | Command injection through a printer name |
 | 64 MiB body cap, 20-copy cap, 30 jobs/minute | Memory exhaustion and paper exhaustion |
 | Scanner controls (`/scan/*`) are POST only, need the page's per-process random token (`X-Sally-CSRF`, embedded in the status page), the `X-Sally-Local` marker, a `Host` of `127.0.0.1:port` or `localhost:port`, and no `Origin` other than the page's own; no CORS headers | Any web page, Sally included, pausing, scanning, pairing or pointing the agent at another scanner; DNS rebinding |
+| The watched folder is chosen only on the status page (`/scan/folder`, the same POST, page token, marker, Host and Origin rules) and must be an existing folder given in full; the heartbeat names only its last path element | Any web page pointing the agent at a folder to upload |
 | `/status.json` (what the page polls) is GET only with the same Host, Origin and marker checks, no CORS, and counts only | Other sites reading scanner state |
 | The status page itself refuses a foreign `Host` | DNS rebinding reading the print token or the page token |
 
@@ -170,6 +171,7 @@ code is in `internal/`:
 | `internal/secure` | DPAPI (Windows) for the device token and the pages |
 | `internal/singleinstance` | the scanner lock: only one copy drives the scanner |
 | `internal/sound` | the three sounds, generated in code, played through winmm |
+| `internal/watchfolder` | the watched folder: polls a chosen folder and sends settled files through the outbox |
 | `internal/desktop` | ties them together; the status page's Scanner card reads it |
 
 **The scanner on USB (Windows).** Scanners such as the HP ScanJet Pro N4000
@@ -230,6 +232,45 @@ and resume after a restart from the manifests (Sally reports the sides it
 already holds). After Sally confirms a side, the local copy is deleted, or
 kept 7 days when "Keep a copy" is on (the default); a janitor removes kept
 copies after 7 days. The outbox lives in `outbox/` beside `config.json`.
+
+**The watched folder.** For scanners whose own software saves to a folder
+(or anyone saving scans by hand), the status page has a **Watched folder**
+card: type the folder's full path and press *Watch this folder* (*Clear*
+stops). It is stored in `scan.json` with the other per-PC settings. The card
+shows the folder, files waiting, files sent today and the last problem.
+
+- The folder is polled every 2 s (no fsnotify: zero dependencies, and it
+  works on network drives). A file is taken once its size **and** its
+  modification time have stayed the same for 5 s, so a file still being
+  written is never sent half done.
+- Only PDFs and pictures are taken: `pdf`, `jpg`, `jpeg`, `png`, `tif`,
+  `tiff`, and only when the first bytes agree. Temporary and partial files
+  (`~$*`, `*.tmp`, `*.part`, `.*`), empty files and everything else are left
+  where they are; a file over 100 MB is left there with a note.
+- A file directly in the folder is one stack. A sub-folder dropped in is one
+  stack for all of its files (up to 500), sent once every file in it has
+  settled. The `Sent to Sally` folder itself is never looked into.
+- Taking a stack: its files are first copied into the **same outbox** as
+  scanned pages (sealed, fsynced, hashed: "safe on this PC" the same way, and
+  sent with the same device token and uploader), then a journal
+  (`watchfolder.json`, written atomically) records the stack and each file's
+  path, size and time, and only then are the files moved into
+  `<folder>/Sent to Sally/<date>/` (a dropped folder into a sub-folder of its
+  own name there). A name already there gets ` (2)`, ` (3)`…; nothing is
+  ever overwritten. Files that are not sent stay in the dropped folder.
+- Restarts: pending moves in the journal are finished on start (a file whose
+  size or time changed since is a new file and is taken as one). A file
+  found in the folder whose bytes an outbox folder stack already holds (the
+  agent stopped after copying, before journaling) is moved, not sent again.
+  A move Windows refuses because the scanner's software still holds the file
+  is tried again on the next poll; the file is never sent twice meanwhile.
+- On the wire a folder stack is announced with `kind: "FOLDER"`, its file
+  count and `fileName` or `folderName` instead of sheets and sides, and its
+  files go up with their names and types (`…/upload-url` with `files`, then
+  `…/files`). Sally files it as a run with source `FOLDER`,
+  `sourceDetail.door` `WATCHED_FOLDER`, and pairs backs with fronts by its
+  own guess, never by a declared sheet. Pausing the scanner does not pause
+  the folder.
 
 **Sounds.** A tick when a scan starts, a rising chime when a stack is safe, a
 low falling tone on a problem (again after 30 s if a jam is still there).
@@ -332,7 +373,8 @@ go test ./...   # security controls, the request path, autostart comparison,
                 # and scanning: eSCL settings and status, chunked reads and the
                 # drain over a fake USB handle, the auto-start state machine
                 # (jam included), mDNS packets, the outbox, pairing, heartbeat
-                # commands and the stack upload against fake Sally + S3
+                # commands and the stack upload against fake Sally + S3, and
+                # the watched folder (settling, moves, restarts, folder drops)
 go vet ./...
 ```
 
@@ -520,7 +562,8 @@ The installers build and the release publishes them. What is left:
 ```
 
 Beside it: `scan.json` (the paired company, pause, sounds, keep-a-copy, a typed
-scanner address, Sally's last settings; nothing secret), `scan-token.dat` (the
+scanner address, the watched folder, Sally's last settings; nothing secret),
+`watchfolder.json` (the watched folder's journal of moves and today's count), `scan-token.dat` (the
 Sally device token, DPAPI on Windows) and `outbox/` (pages waiting to go up).
 
 `machineId` is random, not a hardware identifier: Sally uses it only to key the
