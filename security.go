@@ -214,7 +214,8 @@ func (s *server) originIsSelf(origin string) bool {
 }
 
 // requireLocalControl guards the scanner controls on the status page (pause,
-// resume, scan now, connect to Sally, sounds, keep copies, scanner address).
+// resume, scan now, connect to Sally, sounds, keep copies, scanner address,
+// watched folder).
 // Stricter than requireLocalPage, which still guards Quit and Start at login
 // unchanged:
 //
