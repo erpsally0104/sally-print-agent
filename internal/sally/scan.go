@@ -3,6 +3,7 @@ package sally
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,58 @@ type Scanner struct {
 	State     string `json:"state"` // IDLE | PROCESSING | STOPPED | JAMMED | OFFLINE | UNKNOWN
 	AdfLoaded bool   `json:"adfLoaded"`
 	Scanning  bool   `json:"scanning"`
+	// ID is the scanner in use (sc- + 20 hex), or the chosen one while it is
+	// not answering. Omitted when there is none.
+	ID string `json:"id,omitempty"`
+	// Problem is the scanner's current problem as one of the agent's own
+	// fixed sentences, never an error's raw text.
+	Problem string `json:"problem,omitempty"`
+	// Held says paper is in the feeder and will not start by itself:
+	// WHILE_PAUSED, AFTER_STOP or AFTER_STOP_ON_PC.
+	Held string `json:"held,omitempty"`
+	// Job is the running pile, present only while Scanning.
+	Job *ScannerJob `json:"job,omitempty"`
+}
+
+// ScannerJob is the running pile.
+type ScannerJob struct {
+	ID        string    `json:"id"`   // j + UTC yyyymmddThhmmss + - + 4 hex
+	Kind      string    `json:"kind"` // AUTO | SCAN_NOW | TEST_SCAN
+	StartedAt time.Time `json:"startedAt"`
+	Sides     int       `json:"sides"`
+	Stopping  bool      `json:"stopping"`
+}
+
+// ScannerChoice is one scanner the PC found.
+type ScannerChoice struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Via       []string `json:"via"` // USB, NETWORK; USB first
+	Detail    string   `json:"detail,omitempty"`
+	Answering bool     `json:"answering"`
+	Feeder    *bool    `json:"feeder,omitempty"`
+	Stable    bool     `json:"stable"`
+}
+
+// CommandResult is what the PC did with a command.
+type CommandResult struct {
+	ID      string `json:"id"`
+	Result  string `json:"result"`
+	Sides   *int   `json:"sides,omitempty"`
+	Sheets  *int   `json:"sheets,omitempty"`
+	Stack   string `json:"stack,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// LocalAction is something a person did on the PC's own status page.
+type LocalAction struct {
+	ID   string    `json:"id"`
+	Kind string    `json:"kind"` // STOP | SELECT_SCANNER
+	At   time.Time `json:"at"`
+	Job  string    `json:"job,omitempty"`
+	// ScannerID is set for SELECT_SCANNER only: an sc- id, or null for
+	// automatic.
+	ScannerID *string `json:"scannerId,omitempty"`
 }
 
 // Pause is the PC's pause state.
@@ -61,13 +114,30 @@ type HeartbeatRequest struct {
 	Outbox        *Outbox        `json:"outbox,omitempty"`
 	WatchedFolder *WatchedFolder `json:"watchedFolder,omitempty"`
 	Error         string         `json:"error,omitempty"`
+
+	// Features is what this agent supports, the server's only version gate.
+	Features []string `json:"features"`
+	// Scanners is every scanner found, at most 16; [] when none.
+	Scanners []ScannerChoice `json:"scanners"`
+	// ChosenScannerID is the scanner picked for this PC; nil (sent as null)
+	// means automatic.
+	ChosenScannerID *string         `json:"chosenScannerId"`
+	Results         []CommandResult `json:"commandResults,omitempty"`
+	LocalActions    []LocalAction   `json:"localActions,omitempty"`
 }
 
 // Command is one instruction delivered on the heartbeat.
 type Command struct {
 	ID           string `json:"id"`
-	Kind         string `json:"kind"` // SCAN_NOW | PAUSE | RESUME | TEST_SCAN
+	Kind         string `json:"kind"` // SCAN_NOW | PAUSE | RESUME | TEST_SCAN | STOP | SELECT_SCANNER
 	PauseMinutes *int   `json:"pauseMinutes"`
+	// Job is the pile a STOP is for: the scanner.job.id the person saw.
+	Job string `json:"job"`
+	// ScannerID is SELECT_SCANNER's scanner: nil when the key is absent,
+	// the literal null for automatic, or a JSON string.
+	ScannerID json.RawMessage `json:"scannerId"`
+	// ByName is who asked (STOP and SELECT_SCANNER), for the status page.
+	ByName string `json:"byName"`
 }
 
 // Settings are the PC's settings, chosen in Sally.
@@ -91,6 +161,9 @@ type HeartbeatResponse struct {
 
 // Heartbeat reports status and collects settings and commands.
 func (c *Client) Heartbeat(ctx context.Context, req HeartbeatRequest) (*HeartbeatResponse, error) {
+	if req.Scanners == nil {
+		req.Scanners = []ScannerChoice{}
+	}
 	var out HeartbeatResponse
 	if _, err := c.do(ctx, http.MethodPost, "/api/agent/heartbeat", req, &out); err != nil {
 		return nil, err

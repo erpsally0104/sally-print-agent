@@ -147,3 +147,63 @@ func TestErrorsAreClassified(t *testing.T) {
 		t.Fatalf("403: %v", err)
 	}
 }
+
+func TestHeartbeatCarriesTheNewFieldsAndDecodesStopAndSelect(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		io.WriteString(w, `{"heartbeatSec":10,"commands":[
+		  {"id":"c1","kind":"STOP","pauseMinutes":null,"job":"j20261014T091502-3f9a","byName":"Asha Rao"},
+		  {"id":"c2","kind":"SELECT_SCANNER","pauseMinutes":null,"scannerId":"sc-0123456789abcdef0123","byName":"Asha Rao"},
+		  {"id":"c3","kind":"SELECT_SCANNER","pauseMinutes":null,"scannerId":null},
+		  {"id":"c4","kind":"SELECT_SCANNER","pauseMinutes":null}]}`)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "test")
+	c.SetAuth("tok", "co-1")
+	r, err := c.Heartbeat(context.Background(), HeartbeatRequest{AgentVersion: "0.3.0", Features: []string{"COMMAND_RESULTS", "STOP", "SCANNERS"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hb map[string]any
+	json.Unmarshal(raw, &hb)
+	if f, _ := hb["features"].([]any); len(f) != 3 {
+		t.Fatalf("features %v", hb["features"])
+	}
+	if s, ok := hb["scanners"].([]any); !ok || len(s) != 0 {
+		t.Fatalf("scanners must be [], got %s", raw)
+	}
+	if v, ok := hb["chosenScannerId"]; !ok || v != nil {
+		t.Fatalf("chosenScannerId must be null, got %s", raw)
+	}
+	for _, k := range []string{"commandResults", "localActions"} {
+		if _, ok := hb[k]; ok {
+			t.Fatalf("%s must be omitted when empty: %s", k, raw)
+		}
+	}
+	if r.Commands[0].Job != "j20261014T091502-3f9a" || r.Commands[0].ByName != "Asha Rao" {
+		t.Fatalf("%+v", r.Commands[0])
+	}
+	if string(r.Commands[1].ScannerID) != `"sc-0123456789abcdef0123"` || string(r.Commands[2].ScannerID) != "null" || r.Commands[3].ScannerID != nil {
+		t.Fatalf("scannerId %q %q %v", r.Commands[1].ScannerID, r.Commands[2].ScannerID, r.Commands[3].ScannerID)
+	}
+}
+
+func TestAnnounceStackSendsEndedOnlyWhenSet(t *testing.T) {
+	var got []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		json.NewDecoder(r.Body).Decode(&in)
+		got = append(got, in)
+		w.WriteHeader(201)
+		io.WriteString(w, `{"runId":"r","received":[]}`)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "test")
+	c.SetAuth("tok", "co-1")
+	c.AnnounceStack(context.Background(), "s1", 1, 2, time.Now(), "")
+	c.AnnounceStack(context.Background(), "s2", 1, 2, time.Now(), "STOPPED")
+	if _, ok := got[0]["ended"]; ok || got[1]["ended"] != "STOPPED" {
+		t.Fatalf("%v", got)
+	}
+}
