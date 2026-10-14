@@ -148,3 +148,60 @@ func TestFollowUpAsksForWhatIsMissing(t *testing.T) {
 		t.Fatal("nothing to ask")
 	}
 }
+
+// replyWith is one scanner's _uscan and _uscans records under label, with
+// the given TXT pairs.
+func replyWith(label string, kvs ...string) []byte {
+	inst := label + "._uscan._tcp.local."
+	instS := label + "._uscans._tcp.local."
+	p := newPacket()
+	p.rr(ServiceHTTP, TypePTR, func() { p.name(inst) })
+	p.rr(ServiceHTTPS, TypePTR, func() { p.name(instS) })
+	srv := func(port uint16) func() {
+		return func() {
+			p.b = append(p.b, 0, 0, 0, 0)
+			p.b = binary.BigEndian.AppendUint16(p.b, port)
+			p.name("scanner-host.local.")
+		}
+	}
+	p.rr(inst, TypeSRV, srv(80))
+	p.rr(instS, TypeSRV, srv(443))
+	txt := func() {
+		for _, kv := range kvs {
+			p.b = append(p.b, byte(len(kv)))
+			p.b = append(p.b, kv...)
+		}
+	}
+	p.rr(inst, TypeTXT, txt)
+	p.rr(instS, TypeTXT, txt)
+	p.rr("scanner-host.local.", TypeA, func() { p.b = append(p.b, 192, 168, 1, 41) })
+	return p.b
+}
+
+func TestResolveReadsTheTXTUUIDOnBothEntries(t *testing.T) {
+	recs, err := Parse(replyWith("Example Scanner [0A0B0C]", "ty=Example Scanner 4000", "UUID=  0e1d2c3b-4a59-6877-8695-a4b3c2d1e0f9 "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svcs := Resolve(recs)
+	if len(svcs) != 2 {
+		t.Fatalf("%+v", svcs)
+	}
+	for _, s := range svcs {
+		if s.UUID != "0e1d2c3b-4a59-6877-8695-a4b3c2d1e0f9" || s.Label != "Example Scanner [0A0B0C]" {
+			t.Fatalf("%+v", s)
+		}
+	}
+}
+
+func TestResolveStripsControlBytes(t *testing.T) {
+	recs, _ := Parse(replyWith("Desk\x00 Scan\x1bner", "ty=Model\x00 X\x7f", "rs=eSCL"))
+	svcs := Resolve(recs)
+	if len(svcs) != 2 || svcs[0].Label != "Desk Scanner" || svcs[0].Name != "Model X" {
+		t.Fatalf("%+v", svcs)
+	}
+	recs, _ = Parse(replyWith("\x01\x02\x03", "ty=Model"))
+	if svcs := Resolve(recs); len(svcs) != 0 {
+		t.Fatalf("a label of control bytes only must be dropped: %+v", svcs)
+	}
+}

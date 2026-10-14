@@ -191,12 +191,18 @@ func readName(msg []byte, off int) (string, int, error) {
 // Service is one scanner found.
 type Service struct {
 	Instance string // "HP ScanJet Pro N4000 [ABCDEF]._uscan._tcp.local."
-	Name     string // model from TXT ty, or the instance label
-	Host     string
-	IP       net.IP
-	Port     uint16
-	Secure   bool   // _uscans: HTTPS
-	Root     string // TXT rs, "eSCL" by default
+	// Label is the instance label ("HP ScanJet Pro N4000 [ABCDEF]") with
+	// control characters removed.
+	Label  string
+	Name   string // model from TXT ty, or the instance label
+	Host   string
+	IP     net.IP
+	Port   uint16
+	Secure bool   // _uscans: HTTPS
+	Root   string // TXT rs, "eSCL" by default
+	// UUID is TXT "UUID" as the scanner sent it (trimmed, at most 64
+	// bytes), or "".
+	UUID string
 }
 
 // BaseURL is scheme://ip:port for the eSCL client.
@@ -211,6 +217,10 @@ func (s Service) BaseURL() string {
 // Resolve joins PTR → SRV/TXT → A records into services. Only services with
 // an address and a port are returned. HTTP and HTTPS entries of the same
 // instance stay separate; callers may prefer either.
+//
+// Instance labels and TXT values are anyone's on the LAN to write, so
+// control characters are removed from them, and an instance whose label is
+// nothing but control characters is dropped.
 func Resolve(recs []Record) []Service {
 	srv := map[string]Record{}
 	txt := map[string][]string{}
@@ -249,6 +259,10 @@ func Resolve(recs []Record) []Service {
 		if ip == nil {
 			continue
 		}
+		label := strings.TrimSpace(stripControl(instanceLabel(p.Target)))
+		if label == "" {
+			continue
+		}
 		svc := Service{
 			Instance: p.Target,
 			Host:     s.Target,
@@ -256,17 +270,25 @@ func Resolve(recs []Record) []Service {
 			Port:     s.Port,
 			Secure:   strings.EqualFold(p.Name, ServiceHTTPS),
 			Root:     "eSCL",
-			Name:     instanceLabel(p.Target),
+			Label:    label,
+			Name:     label,
 		}
 		for _, kv := range txt[key(p.Target)] {
 			k, v, _ := strings.Cut(kv, "=")
+			v = stripControl(v)
 			switch strings.ToLower(k) {
 			case "rs":
 				svc.Root = strings.Trim(v, "/")
 			case "ty":
-				if v != "" {
+				if v = strings.TrimSpace(v); v != "" {
 					svc.Name = v
 				}
+			case "uuid":
+				v = strings.TrimSpace(v)
+				if len(v) > 64 {
+					v = v[:64]
+				}
+				svc.UUID = v
 			}
 		}
 		out = append(out, svc)
@@ -281,6 +303,16 @@ func Resolve(recs []Record) []Service {
 }
 
 func key(name string) string { return strings.ToLower(name) }
+
+// stripControl removes bytes below 0x20 and 0x7F.
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7F {
+			return -1
+		}
+		return r
+	}, s)
+}
 
 func isService(name string) bool {
 	return strings.EqualFold(name, ServiceHTTP) || strings.EqualFold(name, ServiceHTTPS)
