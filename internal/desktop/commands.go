@@ -3,6 +3,7 @@ package desktop
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"time"
 
@@ -178,10 +179,17 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// queueAction adds a status-page action to report, dropping the oldest past
-// maxLocalActions. Call with a.mu held.
+// queueActionLocked adds a status-page action to report, dropping the
+// oldest past maxLocalActions. A SELECT_SCANNER always carries scannerId:
+// the id, or null for automatic.
 func (a *Agent) queueActionLocked(kind, job string, scannerID *string) {
-	act := sally.LocalAction{ID: "pc-" + randomHex(8), Kind: kind, At: a.opt.Now().UTC(), Job: job, ScannerID: scannerID}
+	act := sally.LocalAction{ID: "pc-" + randomHex(8), Kind: kind, At: a.opt.Now().UTC(), Job: job}
+	if kind == "SELECT_SCANNER" {
+		act.ScannerID = json.RawMessage("null")
+		if scannerID != nil {
+			act.ScannerID, _ = json.Marshal(*scannerID)
+		}
+	}
 	a.actions = append(a.actions, act)
 	if n := len(a.actions) - maxLocalActions; n > 0 {
 		a.actions = append([]sally.LocalAction(nil), a.actions[n:]...)

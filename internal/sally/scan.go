@@ -69,9 +69,9 @@ type LocalAction struct {
 	Kind string    `json:"kind"` // STOP | SELECT_SCANNER
 	At   time.Time `json:"at"`
 	Job  string    `json:"job,omitempty"`
-	// ScannerID is set for SELECT_SCANNER only: an sc- id, or null for
-	// automatic.
-	ScannerID *string `json:"scannerId,omitempty"`
+	// ScannerID is set for SELECT_SCANNER only: an sc- id as a JSON
+	// string, or the literal null for automatic. Omitted for STOP.
+	ScannerID json.RawMessage `json:"scannerId,omitempty"`
 }
 
 // Pause is the PC's pause state.

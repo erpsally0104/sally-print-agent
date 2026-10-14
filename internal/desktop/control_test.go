@@ -60,7 +60,8 @@ func num(m map[string]any, k string) float64 {
 // startStopTest scans a duplex pile from a Sally Scan now, holding the
 // scanner after side 3, and asks Sally to stop it there.
 func startStopTest(t *testing.T) (*fakeScanner, *fakeSallyAll, *Agent, *soundLog) {
-	sc := &fakeScanner{pages: 10, holdAt: 3}
+	// After the DELETE the rest of the pile still reads loaded.
+	sc := &fakeScanner{pages: 10, holdAt: 3, adfAfterDelete: "ScannerAdfLoaded"}
 	scSrv := httptest.NewServer(sc)
 	t.Cleanup(scSrv.Close)
 	fs := newFakeSallyAll(t)
@@ -136,7 +137,7 @@ func TestAStopAfterAFrontWaitsForItsBackAndKeepsWholeSheets(t *testing.T) {
 		t.Fatalf("a job started during the hold: %d", jobs)
 	}
 	// Taken out, then put back: it starts.
-	sc.set(func(f *fakeScanner) { f.loaded = false })
+	sc.set(func(f *fakeScanner) { f.loaded, f.adfAfterDelete = false, "" })
 	waitFor(t, "the hold to lift", func() bool { return a.Snapshot().HoldState == "" })
 	sc.set(func(f *fakeScanner) { f.loaded = true })
 	waitFor(t, "the next pile", func() bool {
@@ -699,5 +700,17 @@ func TestTextIsCutOnRuneBoundaries(t *testing.T) {
 	req, _ := a.report()
 	if strings.ContainsRune(req.Scanner.Name, 0) || !utf8.ValidString(req.Scanner.Name) || utf8.RuneCountInString(req.Scanner.Name) != 120 {
 		t.Fatalf("%q", req.Scanner.Name)
+	}
+}
+
+func TestAnAutomaticPickOnThePageIsSentAsNull(t *testing.T) {
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	if err := a.SelectScanner(""); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := a.report()
+	b, _ := json.Marshal(req.LocalActions)
+	if !strings.Contains(string(b), `"kind":"SELECT_SCANNER"`) || !strings.Contains(string(b), `"scannerId":null`) {
+		t.Fatalf("%s", b)
 	}
 }

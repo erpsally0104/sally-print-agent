@@ -114,6 +114,9 @@ type Skip struct {
 	USBKey string
 	// Cache, when set, lets Look reuse recent probes (inventoryLoop).
 	Cache *ProbeCache
+	// Seen holds the sighting keys of scanners already on the list, which
+	// go ahead of new mDNS adverts.
+	Seen map[string]bool
 }
 
 // ProbeCache remembers the last probe of each sighting, so the inventory
@@ -324,7 +327,7 @@ func mdnsSightings(svcs []mdns.Service, skip Skip, known map[string]string) []si
 		if skipped(urls, skip) {
 			continue
 		}
-		if _, ok := known[k]; ok {
+		if _, ok := known[k]; ok || skip.Seen[k] {
 			seen = append(seen, *s)
 		} else {
 			fresh = append(fresh, *s)

@@ -441,11 +441,14 @@ func (a *Agent) SelectScanner(id string) error {
 func (a *Agent) chooseLocked(id *string, by string) error {
 	now := a.opt.Now().UTC()
 	if id == nil {
+		was := a.local.ScannerID
 		a.local.ScannerID, a.local.ScannerName, a.local.ScannerVia = "", "", nil
 		a.local.ScannerChosenBy, a.local.ScannerChosenAt = by, &now
 		a.saveLocked()
 		a.logf("the scanner is picked automatically now (chosen by %s)", byWho(by))
-		a.kickScanner()
+		if was != "" {
+			a.kickScanner()
+		}
 		return nil
 	}
 	if !ValidScannerID(*id) {
@@ -459,11 +462,14 @@ func (a *Agent) chooseLocked(id *string, by string) error {
 	} else {
 		return errNotOnList
 	}
+	was := a.local.ScannerID
 	a.local.ScannerID, a.local.ScannerName, a.local.ScannerVia = *id, name, via
 	a.local.ScannerChosenBy, a.local.ScannerChosenAt = by, &now
 	a.saveLocked()
 	a.logf("scanner %s (%s) chosen by %s", name, *id, byWho(by))
-	a.kickScanner()
+	if was != *id {
+		a.kickScanner()
+	}
 	return nil
 }
 
@@ -841,8 +847,14 @@ func (a *Agent) report() (sally.HeartbeatRequest, map[string]uint64) {
 
 // lapseLocked reports each Scan now whose 2 minutes passed without paper:
 // NO_PAPER when the scanner answered idle with no jam, otherwise why not.
-func (a *Agent) lapseLocked(now time.Time) {
-	for _, id := range a.machine.TakeLapsed(now) {
+// It reports whether it recorded anything.
+func (a *Agent) lapseLocked(now time.Time) bool {
+	ids := a.machine.TakeLapsed(now)
+	recorded := false
+	for _, id := range ids {
+		if id != "" {
+			recorded = true
+		}
 		switch {
 		case !a.scannerOpen || !a.lastObs.Reachable:
 			a.results.record(id, resFailed, nil, nil, "", "The scanner is not answering.")
@@ -852,6 +864,7 @@ func (a *Agent) lapseLocked(now time.Time) {
 			a.results.record(id, resNoPaper, nil, nil, "", "")
 		}
 	}
+	return recorded
 }
 
 // short cuts s to at most 200 bytes, on a rune boundary.
@@ -1414,8 +1427,11 @@ func (a *Agent) watch(ctx context.Context, sc *Scanner) {
 			a.startPileLocked(now, kind)
 			seq = a.jobSeq
 		}
-		a.lapseLocked(now)
+		lapsed := a.lapseLocked(now)
 		a.mu.Unlock()
+		if lapsed {
+			a.kickHeartbeat()
+		}
 
 		if err != nil && fails >= 5 {
 			a.logf("the scanner stopped answering: %v", err)

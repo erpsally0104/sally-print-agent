@@ -240,6 +240,7 @@ type fakeScanner struct {
 	// AdfState the feeder reports after a DELETE, until loaded changes.
 	state          string
 	adfAfterDelete string
+	afterDelete    bool
 	// startStatus answers ScanJobs with this status (0 = 201).
 	startStatus int
 }
@@ -274,7 +275,7 @@ func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		adf := "ScannerAdfEmpty"
 		if f.jam {
 			adf = "ScannerAdfJam"
-		} else if f.adfAfterDelete != "" {
+		} else if f.afterDelete && f.adfAfterDelete != "" {
 			adf = f.adfAfterDelete
 		} else if f.loaded {
 			adf = "ScannerAdfLoaded"
@@ -301,6 +302,7 @@ func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(201)
 	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/eSCL/ScanJobs/"):
 		f.deleted = append(f.deleted, r.URL.Path)
+		f.afterDelete = true
 		w.WriteHeader(200)
 	case strings.HasSuffix(r.URL.Path, "/NextDocument"):
 		if f.failAt > 0 && f.served == f.failAt {

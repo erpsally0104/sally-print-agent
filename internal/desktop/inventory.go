@@ -50,6 +50,14 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	addr := a.local.ScannerAddress
 	skip := a.openSkip
 	skip.Cache = a.probes
+	skip.Seen = map[string]bool{}
+	for _, f := range a.inventory {
+		for _, b := range f.Net {
+			if b.keys.key != "" {
+				skip.Seen[b.keys.key] = true
+			}
+		}
+	}
 	known := make(map[string]string, len(a.local.KnownScanners))
 	for k, v := range a.local.KnownScanners {
 		known[k] = v
