@@ -33,7 +33,9 @@ func newAgent(t *testing.T, baseURL string, disc Discoverer) *Agent {
 }
 
 // noLook finds nothing: tests never browse the real LAN.
-func noLook(context.Context, string, Skip, map[string]string, func(string, ...any)) []Found { return nil }
+func noLook(context.Context, string, Skip, map[string]string, func(string, ...any)) []Found {
+	return nil
+}
 
 func pairedAgent(t *testing.T, baseURL string, disc Discoverer) *Agent {
 	a := newAgent(t, baseURL, disc)
@@ -221,12 +223,34 @@ type fakeScanner struct {
 	body   string
 	// simplex: the capabilities advertise no duplex feeder.
 	simplex bool
-	// failAt answers NextDocument 500 after this many pages (0 = never).
-	failAt  int
-	deleted []string
+	// failAt answers NextDocument 500 (with failBody) after this many
+	// pages (0 = never).
+	failAt   int
+	failBody string
+	deleted  []string
+	// uuid and serial go in the capabilities; certs adds the nested
+	// Certification Version 1.3 the HP N4000 sends.
+	uuid, serial string
+	certs        bool
+	// pageDelay slows each page; holdAt answers NextDocument 503 once this
+	// many pages are served, until it is set back to 0.
+	pageDelay time.Duration
+	holdAt    int
+	// state is pwg:State ("Idle" when empty); adfAfterDelete is the
+	// AdfState the feeder reports after a DELETE, until loaded changes.
+	state          string
+	adfAfterDelete string
+	// startStatus answers ScanJobs with this status (0 = 201).
+	startStatus int
 }
 
 func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/NextDocument") {
+		f.mu.Lock()
+		d := f.pageDelay
+		f.mu.Unlock()
+		time.Sleep(d)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch {
@@ -235,15 +259,31 @@ func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.simplex {
 			adf = `<scan:Adf><scan:AdfSimplexInputCaps/><scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption></scan:AdfOptions></scan:Adf>`
 		}
-		fmt.Fprintf(w, `<scan:ScannerCapabilities xmlns:scan="%s" xmlns:pwg="%s"><pwg:Version>2.9</pwg:Version><pwg:MakeAndModel>HP ScanJet Pro N4000 snw1</pwg:MakeAndModel>%s</scan:ScannerCapabilities>`, escl.NSScan, escl.NSPWG, adf)
+		extra := ""
+		if f.uuid != "" {
+			extra += "<scan:UUID>" + f.uuid + "</scan:UUID>"
+		}
+		if f.serial != "" {
+			extra += "<pwg:SerialNumber>" + f.serial + "</pwg:SerialNumber>"
+		}
+		if f.certs {
+			extra += "<scan:Certifications><scan:Certification><scan:Name>mopria-certified-scan</scan:Name><scan:Version>1.3</scan:Version></scan:Certification></scan:Certifications>"
+		}
+		fmt.Fprintf(w, `<scan:ScannerCapabilities xmlns:scan="%s" xmlns:pwg="%s"><pwg:Version>2.9</pwg:Version><pwg:MakeAndModel>HP ScanJet Pro N4000 snw1</pwg:MakeAndModel>%s%s</scan:ScannerCapabilities>`, escl.NSScan, escl.NSPWG, extra, adf)
 	case r.URL.Path == "/eSCL/ScannerStatus":
 		adf := "ScannerAdfEmpty"
 		if f.jam {
 			adf = "ScannerAdfJam"
+		} else if f.adfAfterDelete != "" {
+			adf = f.adfAfterDelete
 		} else if f.loaded {
 			adf = "ScannerAdfLoaded"
 		}
-		fmt.Fprintf(w, `<scan:ScannerStatus xmlns:scan="%s" xmlns:pwg="%s"><pwg:State>Idle</pwg:State><scan:AdfState>%s</scan:AdfState></scan:ScannerStatus>`, escl.NSScan, escl.NSPWG, adf)
+		state := f.state
+		if state == "" {
+			state = "Idle"
+		}
+		fmt.Fprintf(w, `<scan:ScannerStatus xmlns:scan="%s" xmlns:pwg="%s"><pwg:State>%s</pwg:State><scan:AdfState>%s</scan:AdfState></scan:ScannerStatus>`, escl.NSScan, escl.NSPWG, state, adf)
 	case r.Method == "POST" && r.URL.Path == "/eSCL/ScanJobs":
 		b, _ := io.ReadAll(r.Body)
 		f.body = string(b)
@@ -251,19 +291,30 @@ func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(409)
 			return
 		}
+		if f.startStatus != 0 {
+			w.WriteHeader(f.startStatus)
+			io.WriteString(w, "SECRET-START-BODY")
+			return
+		}
 		f.jobs++
 		w.Header().Set("Location", fmt.Sprintf("http://%s/eSCL/ScanJobs/%d", r.Host, f.jobs))
 		w.WriteHeader(201)
 	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/eSCL/ScanJobs/"):
 		f.deleted = append(f.deleted, r.URL.Path)
+		w.WriteHeader(200)
 	case strings.HasSuffix(r.URL.Path, "/NextDocument"):
 		if f.failAt > 0 && f.served == f.failAt {
 			w.WriteHeader(500)
+			io.WriteString(w, f.failBody)
 			return
 		}
 		if f.jamAt > 0 && f.served == f.jamAt {
 			f.jam, f.loaded = true, false
 			w.WriteHeader(404)
+			return
+		}
+		if f.holdAt > 0 && f.served >= f.holdAt {
+			w.WriteHeader(503)
 			return
 		}
 		if f.served >= f.pages {
@@ -281,18 +332,29 @@ func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (f *fakeScanner) set(fn func(f *fakeScanner)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn(f)
+}
+
 func discoverAt(url string) Discoverer {
 	return func(ctx context.Context, _ string, _ func(string, ...any)) (*Scanner, error) {
 		return openBase(ctx, url, "eSCL", "")
 	}
 }
 
-// fakeSallyAll accepts everything and counts confirmed sides.
+// fakeSallyAll accepts everything and counts confirmed sides. It records
+// heartbeat bodies and hands over queued commands on the next one.
 type fakeSallyAll struct {
 	mu        sync.Mutex
 	sides     int
 	done      int
 	announced []map[string]any
+	beats     []map[string]any
+	queued    []string
+	// failBeats answers this many heartbeats 500.
+	failBeats int
 	srv       *httptest.Server
 }
 
@@ -306,7 +368,14 @@ func newFakeSallyAll(t *testing.T) *fakeSallyAll {
 		p := r.URL.Path
 		switch {
 		case p == "/api/agent/heartbeat":
-			io.WriteString(w, `{"heartbeatSec":10}`)
+			f.beats = append(f.beats, in)
+			if f.failBeats > 0 {
+				f.failBeats--
+				w.WriteHeader(500)
+				return
+			}
+			fmt.Fprintf(w, `{"heartbeatSec":10,"commands":[%s]}`, strings.Join(f.queued, ","))
+			f.queued = nil
 		case p == "/api/agent/scan/stacks":
 			f.announced = append(f.announced, in)
 			w.WriteHeader(201)
@@ -332,6 +401,39 @@ func newFakeSallyAll(t *testing.T) *fakeSallyAll {
 	return f
 }
 
+// queue hands cmd (a JSON object) over on the next heartbeat.
+func (f *fakeSallyAll) queue(cmd string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queued = append(f.queued, cmd)
+}
+
+// results returns every commandResults entry sent for id, in order.
+func (f *fakeSallyAll) results(id string) []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []map[string]any
+	for _, b := range f.beats {
+		rs, _ := b["commandResults"].([]any)
+		for _, r := range rs {
+			m := r.(map[string]any)
+			if m["id"] == id {
+				out = append(out, m)
+			}
+		}
+	}
+	return out
+}
+
+// lastResult is the latest result sent for id, or "".
+func (f *fakeSallyAll) lastResult(id string) map[string]any {
+	rs := f.results(id)
+	if len(rs) == 0 {
+		return nil
+	}
+	return rs[len(rs)-1]
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -345,7 +447,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func TestScanNowScansAStackAndSendsIt(t *testing.T) {
-	sc := &fakeScanner{loaded: true, pages: 6}
+	sc := &fakeScanner{loaded: true, pages: 6, certs: true, uuid: "0E1D2C3B-4A59-6877-8695-A4B3C2D1E0F9"}
 	scSrv := httptest.NewServer(sc)
 	defer scSrv.Close()
 	sally := newFakeSallyAll(t)
@@ -366,6 +468,9 @@ func TestScanNowScansAStackAndSendsIt(t *testing.T) {
 	v := a.Snapshot()
 	if v.Receipt != "Got 3 sheets. Safe on this PC." {
 		t.Fatalf("receipt %q", v.Receipt)
+	}
+	if v.ScannerID != ScannerID("uuid:0e1d2c3b-4a59-6877-8695-a4b3c2d1e0f9") {
+		t.Fatalf("the scanner's id comes from its UUID: %q", v.ScannerID)
 	}
 	sally.mu.Lock()
 	if sally.sides != 6 || sally.announced[0]["sheets"] != float64(3) || sally.announced[0]["sides"] != float64(6) {
