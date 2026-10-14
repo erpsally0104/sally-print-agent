@@ -49,6 +49,9 @@ type local struct {
 	ScannerVia      []string   `json:"scannerVia,omitempty"`
 	ScannerChosenBy string     `json:"scannerChosenBy,omitempty"`
 	ScannerChosenAt *time.Time `json:"scannerChosenAt,omitempty"`
+	// ScannerUnstable: the chosen scanner's id is a last-resort one, which
+	// can change after replugging or renaming.
+	ScannerUnstable bool `json:"scannerUnstable,omitempty"`
 
 	// KnownScanners maps a sighting (a USB device key, an mDNS label and
 	// host, or a typed address) to the id its capabilities last gave, so a

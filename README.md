@@ -396,7 +396,7 @@ ordinary stack, uploaded like any other: the Setup wizard's "try one copy"
 watches for the next run from this PC.
 
 `scan.json` keeps, besides the pause and the per-PC switches, the choice
-(`scannerId`, `scannerName`, `scannerVia`, `scannerChosenBy`,
+(`scannerId`, `scannerName`, `scannerVia`, `scannerUnstable`, `scannerChosenBy`,
 `scannerChosenAt`) and `knownScanners` (at most 16 sighting → id pairs, so a
 scanner keeps its id while its capabilities do not answer). An older agent
 rewrites `scan.json` without them, so a downgrade to 0.2.0 loses the choice

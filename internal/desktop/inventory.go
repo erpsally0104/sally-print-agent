@@ -42,9 +42,13 @@ func (a *Agent) inventoryLoop(ctx context.Context) {
 // inventoryPass runs one Look and merges it into the list. It skips while
 // a pile scans.
 func (a *Agent) inventoryPass(ctx context.Context) {
+	// lookMu first: the scanner loop marks a scanner it opens in openSkip
+	// before it lets go of lookMu, so the skip read below is never stale.
+	a.lookMu.Lock()
 	a.mu.Lock()
 	if a.job != nil {
 		a.mu.Unlock()
+		a.lookMu.Unlock()
 		return
 	}
 	addr := a.local.ScannerAddress
@@ -64,7 +68,6 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	}
 	a.mu.Unlock()
 
-	a.lookMu.Lock()
 	found := a.opt.Look(ctx, addr, skip, known, a.logf)
 	a.lookMu.Unlock()
 	if ctx.Err() != nil {
@@ -263,7 +266,7 @@ func (a *Agent) orderedLocked() []Found {
 	chosen := a.local.ScannerID
 	if chosen != "" {
 		if _, ok := a.foundLocked(chosen); !ok {
-			f := Found{ID: chosen, Name: a.local.ScannerName, Stable: true}
+			f := Found{ID: chosen, Name: a.local.ScannerName, Stable: !a.local.ScannerUnstable}
 			if f.Name == "" {
 				f.Name = "Scanner"
 			}

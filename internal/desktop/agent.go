@@ -442,7 +442,7 @@ func (a *Agent) chooseLocked(id *string, by string) error {
 	now := a.opt.Now().UTC()
 	if id == nil {
 		was := a.local.ScannerID
-		a.local.ScannerID, a.local.ScannerName, a.local.ScannerVia = "", "", nil
+		a.local.ScannerID, a.local.ScannerName, a.local.ScannerVia, a.local.ScannerUnstable = "", "", nil, false
 		a.local.ScannerChosenBy, a.local.ScannerChosenAt = by, &now
 		a.saveLocked()
 		a.logf("the scanner is picked automatically now (chosen by %s)", byWho(by))
@@ -454,16 +454,16 @@ func (a *Agent) chooseLocked(id *string, by string) error {
 	if !ValidScannerID(*id) {
 		return errNotOnList
 	}
-	name, via := "", []string(nil)
+	name, via, unstable := "", []string(nil), false
 	if f, ok := a.foundLocked(*id); ok {
-		name, via = f.Name, f.Via()
+		name, via, unstable = f.Name, f.Via(), !f.Stable
 	} else if *id == a.local.ScannerID {
-		name, via = a.local.ScannerName, a.local.ScannerVia
+		name, via, unstable = a.local.ScannerName, a.local.ScannerVia, a.local.ScannerUnstable
 	} else {
 		return errNotOnList
 	}
 	was := a.local.ScannerID
-	a.local.ScannerID, a.local.ScannerName, a.local.ScannerVia = *id, name, via
+	a.local.ScannerID, a.local.ScannerName, a.local.ScannerVia, a.local.ScannerUnstable = *id, name, via, unstable
 	a.local.ScannerChosenBy, a.local.ScannerChosenAt = by, &now
 	a.saveLocked()
 	a.logf("scanner %s (%s) chosen by %s", name, *id, byWho(by))
@@ -803,7 +803,7 @@ func (a *Agent) report() (sally.HeartbeatRequest, map[string]uint64) {
 	req.Scanner = &sally.Scanner{
 		Kind: a.scanner.Kind, Name: cutRunes(a.scanner.Name, 120), State: a.scanner.State,
 		AdfLoaded: a.scanner.AdfLoaded, Scanning: a.scanner.Scanning,
-		ID: a.scanner.ID, Problem: cutRunes(a.problem, 200), Held: a.machine.Held(),
+		ID: a.scanner.ID, Problem: problemForSally(a.problem), Held: a.machine.Held(),
 	}
 	if a.job != nil && a.scanner.Scanning {
 		j := *a.job
@@ -865,6 +865,20 @@ func (a *Agent) lapseLocked(now time.Time) bool {
 		}
 	}
 	return recorded
+}
+
+// problemForSally is the problem as Sally gets it: at most 200 runes, cut
+// at the end of a sentence, so a long one (the jam words after a Stop run
+// to 204-207) never reaches Sally cut mid-word.
+func problemForSally(p string) string {
+	cut := cutRunes(p, 200)
+	if cut == cutRunes(p, 1000) {
+		return cut
+	}
+	if i := strings.LastIndex(cut, ". "); i > 0 {
+		return cut[:i+1]
+	}
+	return cut
 }
 
 // short cuts s to at most 200 bytes, on a rune boundary.
@@ -1236,6 +1250,11 @@ func (a *Agent) scannerLoop(ctx context.Context) {
 		if chosen == "" {
 			a.lookMu.Lock()
 			sc, err = a.opt.Discover(ctx, addr, a.logf)
+			if sc != nil {
+				a.mu.Lock()
+				a.openSkip = skipOf(sc)
+				a.mu.Unlock()
+			}
 			a.lookMu.Unlock()
 			if err != nil {
 				a.logf("looking for a scanner failed: %v", err)
@@ -1267,11 +1286,15 @@ func (a *Agent) scannerLoop(ctx context.Context) {
 		}
 		a.mu.Lock()
 		if a.local.ScannerID != chosen {
-			// The choice changed while it was opening.
+			// The choice changed while it was opening. Closed first: the list
+			// leaves the scanner alone until it is.
 			a.mu.Unlock()
 			if sc.Close != nil {
 				sc.Close()
 			}
+			a.mu.Lock()
+			a.openSkip = Skip{}
+			a.mu.Unlock()
 			continue
 		}
 		a.openedLocked(sc)
@@ -1280,12 +1303,13 @@ func (a *Agent) scannerLoop(ctx context.Context) {
 			map[bool]string{true: "both sides", false: "one side"}[sc.Client.Duplex], sc.ID)
 		a.kickHeartbeat()
 		a.watch(ctx, sc)
-		a.mu.Lock()
-		a.scannerOpen, a.inUse, a.openSkip = false, nil, Skip{}
-		a.mu.Unlock()
+		// Closed first: the list leaves the scanner alone until it is.
 		if sc.Close != nil {
 			sc.Close()
 		}
+		a.mu.Lock()
+		a.scannerOpen, a.inUse, a.openSkip = false, nil, Skip{}
+		a.mu.Unlock()
 	}
 }
 
@@ -1311,6 +1335,11 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
 	}
 	a.lookMu.Lock()
 	sc, err := a.opt.OpenFound(ctx, f, a.logf)
+	if err == nil {
+		a.mu.Lock()
+		a.openSkip = skipOf(sc)
+		a.mu.Unlock()
+	}
 	a.lookMu.Unlock()
 	if err != nil {
 		a.logf("the chosen scanner %s is not answering: %v", f.Name, err)
@@ -1330,19 +1359,27 @@ func (a *Agent) openedLocked(sc *Scanner) {
 	}
 	if sc.Kind == "USB" {
 		f.USB = unionStrings([]string{sc.Where}, f.USB)
-		a.openSkip = Skip{USBKey: usbscan.DeviceKey(sc.Where)}
 	} else {
 		f.Net = unionBases([]netBase{{URL: sc.Where, Root: sc.Client.Root}}, f.Net)
-		a.openSkip = Skip{Bases: []string{sc.Where}}
 	}
+	a.openSkip = skipOf(sc)
 	f.Answering = true
 	a.inUse = &f
 	a.learnLocked(sc.learned, a.opt.Now())
 	a.mergeInUseLocked(a.opt.Now())
 	if a.local.ScannerID == sc.ID {
-		a.local.ScannerName, a.local.ScannerVia = sc.Name, f.Via()
+		a.local.ScannerName, a.local.ScannerVia, a.local.ScannerUnstable = sc.Name, f.Via(), !sc.Stable
 		a.saveLocked()
 	}
+}
+
+// skipOf is what the scanner list must leave alone while sc is open: its
+// USB device, or its network base.
+func skipOf(sc *Scanner) Skip {
+	if sc.Kind == "USB" {
+		return Skip{USBKey: usbscan.DeviceKey(sc.Where)}
+	}
+	return Skip{Bases: []string{sc.Where}}
 }
 
 // sleep waits d, or less if the scanner address changed. False when ctx ends.
@@ -1445,25 +1482,20 @@ func (a *Agent) watch(ctx context.Context, sc *Scanner) {
 		if kind != autoscan.None {
 			a.kickHeartbeat()
 			end := a.runJob(ctx, sc, kind, seq)
-			a.mu.Lock()
-			a.machine.Ended()
-			switch {
-			case end.halted:
-				// The rest of the pile is likely still in the feeder: it
-				// waits until the feeder has been cleared.
-				h := autoscan.HoldAfterStop
-				if end.from == stopPC {
-					h = autoscan.HoldAfterStopOnPC
+			if !end.halted {
+				// A halted pile was ended, and its hold set, by runJob in the
+				// same locked step that cleared the job.
+				a.mu.Lock()
+				a.machine.Ended()
+				if end.jam {
+					// The job's own last status showed the jam: that counts as
+					// "something other than idle with paper", even if the
+					// person clears it before the next poll.
+					paused, _ := a.local.paused(a.opt.Now())
+					a.machine.Observe(a.opt.Now(), autoscan.Observation{Reachable: true, Idle: true}, set, paused)
 				}
-				a.machine.HoldUntilClear(h)
-			case end.jam:
-				// The job's own last status showed the jam: that counts as
-				// "something other than idle with paper", even if the person
-				// clears it before the next poll.
-				paused, _ := a.local.paused(a.opt.Now())
-				a.machine.Observe(a.opt.Now(), autoscan.Observation{Reachable: true, Idle: true}, set, paused)
+				a.mu.Unlock()
 			}
-			a.mu.Unlock()
 		}
 		t := time.NewTimer(a.opt.PollEvery)
 		select {
@@ -1542,6 +1574,17 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind, seq
 		}
 		a.recordPileEndLocked(end)
 		a.jobWaiters, a.stopIDs, a.stopFor, a.stopFrom, a.stopBy = nil, nil, 0, "", ""
+		if end.halted {
+			// The rest of the pile is likely still in the feeder: it waits
+			// until the feeder has been cleared. Set here, so no check-in or
+			// command sees the pile over without its hold.
+			a.machine.Ended()
+			h := autoscan.HoldAfterStop
+			if end.from == stopPC {
+				h = autoscan.HoldAfterStopOnPC
+			}
+			a.machine.HoldUntilClear(h)
+		}
 		a.mu.Unlock()
 		a.up.Kick()
 		a.kickHeartbeat()

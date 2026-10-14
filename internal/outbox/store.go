@@ -439,9 +439,9 @@ func (w *StackWriter) DropLast() error {
 		m.Sheets = sheetsOf(m.Sides)
 		return err
 	}
-	if err := os.Remove(filepath.Join(s.stackDir(w.id), last.File)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
+	// The manifest no longer lists the side, so it has left the stack either
+	// way: a file that cannot be removed now goes with the stack's folder.
+	_ = os.Remove(filepath.Join(s.stackDir(w.id), last.File))
 	return nil
 }
 
