@@ -71,6 +71,19 @@ func Find() ([]string, error) {
 	return out, nil
 }
 
+// FindAll lists every IPP-over-USB interface the PC knows about, present or
+// not, best first, for the scanner list. Present comes from SetupAPI and
+// Linked from the registry.
+func FindAll() ([]Path, error) {
+	present, _ := setupAPIPaths()
+	linked, other, regErr := registryPaths()
+	out := classify(present, linked, other)
+	if len(out) == 0 && regErr != nil {
+		return nil, regErr
+	}
+	return out, nil
+}
+
 // spDeviceInterfaceData mirrors SP_DEVICE_INTERFACE_DATA.
 type spDeviceInterfaceData struct {
 	cbSize   uint32
