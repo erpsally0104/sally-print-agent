@@ -75,6 +75,13 @@ type Capabilities struct {
 	// (DetectPaperLoaded, the other common AdfOption, says nothing about
 	// sides.) A scanner that says neither is simplex.
 	Duplex bool
+	// SerialNumber and UUID are pwg:SerialNumber and scan:UUID, as the
+	// scanner sent them (trimmed, otherwise raw). They name the device for
+	// the scanner list's stable id (internal/desktop/identity.go).
+	SerialNumber string
+	UUID         string
+	// Feeder: the capabilities list a document feeder (scan:Adf).
+	Feeder bool
 }
 
 // Capabilities reads ScannerCapabilities and remembers the version for the
@@ -92,20 +99,42 @@ func (c *Client) Capabilities(ctx context.Context) (*Capabilities, error) {
 	return caps, nil
 }
 
-// ParseCapabilities reads pwg:Version, pwg:MakeAndModel and whether the
-// feeder is duplex. A missing or odd version falls back to DefaultVersion.
+// ParseCapabilities reads pwg:Version, pwg:MakeAndModel, pwg:SerialNumber,
+// scan:UUID, whether there is a feeder and whether it is duplex. A missing
+// or odd version falls back to DefaultVersion.
+//
+// Version, MakeAndModel, SerialNumber and UUID count only as direct children
+// of ScannerCapabilities, and the first one wins: the HP N4000 nests
+// Certifications/Certification/Version 1.3 after its pwg:Version 2.9, and a
+// job posted with 1.3 is not what the scanner speaks.
 func ParseCapabilities(b []byte) *Capabilities {
 	out := &Capabilities{Version: DefaultVersion}
-	walk(b, func(local, text string) {
-		switch local {
-		case "Version":
-			if validVersion(text) {
-				out.Version = text
+	seen := map[string]bool{}
+	walk(b, func(local, text string, depth int) {
+		if depth == 2 {
+			switch local {
+			case "Version", "MakeAndModel", "SerialNumber", "UUID":
+				if seen[local] {
+					return
+				}
+				seen[local] = true
 			}
-		case "MakeAndModel":
-			if out.MakeAndModel == "" {
+			switch local {
+			case "Version":
+				if validVersion(text) {
+					out.Version = text
+				}
+			case "MakeAndModel":
 				out.MakeAndModel = text
+			case "SerialNumber":
+				out.SerialNumber = text
+			case "UUID":
+				out.UUID = text
 			}
+		}
+		switch local {
+		case "Adf":
+			out.Feeder = true
 		case "AdfDuplexInputCaps":
 			out.Duplex = true
 		case "AdfOption":
@@ -135,6 +164,13 @@ func (s Status) Idle() bool { return s.State == "Idle" }
 
 // Loaded reports whether there is paper in the feeder.
 func (s Status) Loaded() bool { return s.AdfState == "ScannerAdfLoaded" }
+
+// Empty reports a feeder the scanner says is empty.
+func (s Status) Empty() bool { return s.AdfState == "ScannerAdfEmpty" }
+
+// FeederClear reports a feeder with nothing in it: empty, or a scanner that
+// reports no feeder state at all.
+func (s Status) FeederClear() bool { return s.Empty() || s.AdfState == "" }
 
 // Jammed reports a feeder problem that needs a person: a jam, a mispick, a
 // double feed, an open door.
@@ -171,7 +207,7 @@ func (c *Client) Status(ctx context.Context) (*Status, error) {
 // ignored; only the scanner-level State counts.
 func ParseStatus(b []byte) Status {
 	var st Status
-	walk(b, func(local, text string) {
+	walk(b, func(local, text string, _ int) {
 		switch local {
 		case "State":
 			if st.State == "" {
@@ -186,8 +222,9 @@ func ParseStatus(b []byte) Status {
 	return st
 }
 
-// walk calls fn with the local name and text of every leaf element.
-func walk(b []byte, fn func(local, text string)) {
+// walk calls fn with the local name, text and depth (the root is 1) of
+// every element as it ends.
+func walk(b []byte, fn func(local, text string, depth int)) {
 	dec := xml.NewDecoder(bytes.NewReader(b))
 	dec.Strict = false
 	var stack []string
@@ -205,7 +242,7 @@ func walk(b []byte, fn func(local, text string)) {
 			text.Write(t)
 		case xml.EndElement:
 			if len(stack) > 0 {
-				fn(stack[len(stack)-1], strings.TrimSpace(text.String()))
+				fn(stack[len(stack)-1], strings.TrimSpace(text.String()), len(stack))
 				stack = stack[:len(stack)-1]
 			}
 			text.Reset()
@@ -279,9 +316,14 @@ func (c *Client) NextDocument(ctx context.Context, jobPath string) ([]byte, bool
 	}
 }
 
-// CancelJob asks the scanner to drop a job. Best effort.
-func (c *Client) CancelJob(ctx context.Context, jobPath string) {
-	_, _ = c.D.Do(ctx, &Request{Method: http.MethodDelete, Path: jobPath})
+// CancelJob asks the scanner to drop a job. Best effort: it returns the
+// DELETE's HTTP status (0 when there was no answer) for the log.
+func (c *Client) CancelJob(ctx context.Context, jobPath string) (int, error) {
+	resp, err := c.D.Do(ctx, &Request{Method: http.MethodDelete, Path: jobPath})
+	if err != nil {
+		return 0, err
+	}
+	return resp.StatusCode, nil
 }
 
 // IsJPEG checks the JPEG start-of-image marker. Pages are never decoded on

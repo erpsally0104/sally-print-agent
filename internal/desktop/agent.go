@@ -946,8 +946,12 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 		// be told.
 		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		sc.Client.CancelJob(cctx, job)
-		a.logf("scan job %s cancelled", job)
+		status, err := sc.Client.CancelJob(cctx, job)
+		if err != nil {
+			a.logf("scan job %s: the cancel was not answered: %v", job, err)
+		} else {
+			a.logf("scan job %s cancelled (DELETE answered %d)", job, status)
+		}
 	}
 	jam := false
 	var notReadySince time.Time

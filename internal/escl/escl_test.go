@@ -340,3 +340,68 @@ func TestNextDocumentRejectsNonJPEG(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// n4000Caps is shaped like the HP ScanJet Pro N4000's capabilities, with
+// placeholder values: a nested Certification Version 1.3 after the real
+// pwg:Version 2.9, and a UUID inside a child element that must not count.
+const n4000Caps = `<?xml version="1.0"?><scan:ScannerCapabilities xmlns:pwg="` + NSPWG + `" xmlns:scan="` + NSScan + `">
+<pwg:Version>2.9</pwg:Version>
+<pwg:MakeAndModel>Example ScanJet Pro 4000</pwg:MakeAndModel>
+<pwg:SerialNumber>SN-TEST-1</pwg:SerialNumber>
+<scan:UUID>0E1D2C3B-4A59-6877-8695-A4B3C2D1E0F9</scan:UUID>
+<scan:Certifications><scan:Certification><scan:Name>mopria-certified-scan</scan:Name><scan:Version>1.3</scan:Version></scan:Certification></scan:Certifications>
+<scan:Child><scan:UUID>11111111-2222-3333-4444-555555555555</scan:UUID><pwg:SerialNumber>NOT-THIS</pwg:SerialNumber></scan:Child>
+<scan:Adf><scan:AdfSimplexInputCaps/><scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption><scan:AdfOption>Duplex</scan:AdfOption></scan:AdfOptions></scan:Adf>
+</scan:ScannerCapabilities>`
+
+func TestParseCapabilitiesReadsOnlyTopLevelIdentity(t *testing.T) {
+	c := ParseCapabilities([]byte(n4000Caps))
+	if c.Version != "2.9" {
+		t.Fatalf("the nested Certification version won: %q", c.Version)
+	}
+	if c.UUID != "0E1D2C3B-4A59-6877-8695-A4B3C2D1E0F9" || c.SerialNumber != "SN-TEST-1" || c.MakeAndModel != "Example ScanJet Pro 4000" {
+		t.Fatalf("%+v", c)
+	}
+	if !c.Feeder || !c.Duplex {
+		t.Fatalf("feeder %v duplex %v", c.Feeder, c.Duplex)
+	}
+	if !strings.Contains(string(ScanSettings(c.Version, c.Duplex)), "<pwg:Version>2.9</pwg:Version>") {
+		t.Fatal("the job must carry 2.9")
+	}
+	// A version or UUID only inside a child element is ignored.
+	nested := ParseCapabilities([]byte(`<scan:ScannerCapabilities xmlns:pwg="` + NSPWG + `" xmlns:scan="` + NSScan + `"><scan:X><pwg:Version>1.3</pwg:Version><scan:UUID>u</scan:UUID></scan:X></scan:ScannerCapabilities>`))
+	if nested.Version != DefaultVersion || nested.UUID != "" || nested.Feeder {
+		t.Fatalf("%+v", nested)
+	}
+}
+
+func TestFeederEmptyAndClear(t *testing.T) {
+	for _, c := range []struct {
+		adf          string
+		empty, clear bool
+	}{
+		{"ScannerAdfEmpty", true, true},
+		{"", false, true},
+		{"ScannerAdfLoaded", false, false},
+		{"ScannerAdfJam", false, false},
+	} {
+		st := Status{State: "Idle", AdfState: c.adf}
+		if st.Empty() != c.empty || st.FeederClear() != c.clear {
+			t.Errorf("%q: empty %v clear %v", c.adf, st.Empty(), st.FeederClear())
+		}
+	}
+}
+
+func TestCancelJobReturnsTheDeleteStatus(t *testing.T) {
+	var method, path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		w.WriteHeader(204)
+	}))
+	defer srv.Close()
+	d, _ := NewHTTPDoer(srv.URL)
+	status, err := NewClient(d, "").CancelJob(context.Background(), "/eSCL/ScanJobs/1")
+	if err != nil || status != 204 || method != "DELETE" || path != "/eSCL/ScanJobs/1" {
+		t.Fatalf("%d %v %s %s", status, err, method, path)
+	}
+}
