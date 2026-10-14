@@ -119,7 +119,7 @@ through in full at the top of [`security.go`](security.go). In short:
 | Token, delivered automatically to allowlisted origins | Other local processes; also makes pairing invisible |
 | Printer names resolved against the enumerated list | Command injection through a printer name |
 | 64 MiB body cap, 20-copy cap, 30 jobs/minute | Memory exhaustion and paper exhaustion |
-| Scanner controls (`/scan/*`) are POST only, need the page's per-process random token (`X-Sally-CSRF`, embedded in the status page), the `X-Sally-Local` marker, a `Host` of `127.0.0.1:port` or `localhost:port`, and no `Origin` other than the page's own; no CORS headers | Any web page, Sally included, pausing, scanning, pairing or pointing the agent at another scanner; DNS rebinding |
+| Scanner controls (`/scan/*`, including `/scan/stop`, `/scan/select` and `/scan/look`) are POST only, need the page's per-process random token (`X-Sally-CSRF`, embedded in the status page), the `X-Sally-Local` marker, a `Host` of `127.0.0.1:port` or `localhost:port`, and no `Origin` other than the page's own; no CORS headers | Any web page, Sally included, pausing, scanning, stopping a pile, choosing a scanner, pairing or pointing the agent at another scanner; DNS rebinding |
 | The watched folder is chosen only on the status page (`/scan/folder`, the same POST, page token, marker, Host and Origin rules) and must be an existing folder given in full; the heartbeat names only its last path element | Any web page pointing the agent at a folder to upload |
 | `/status.json` (what the page polls) is GET only with the same Host, Origin and marker checks, no CORS, and counts only | Other sites reading scanner state |
 | The status page itself refuses a foreign `Host` | DNS rebinding reading the print token or the page token |
@@ -154,6 +154,12 @@ Nothing is ever passed to a shell. Commands are executed with separated
 arguments, and only a printer name the OS itself reported can reach one.
 
 ## Scanning
+
+> **0.3.0 has not yet run on a real scanner.** The scanner list, the
+> scanner choice, Stop this pile and the command results are tested against
+> fakes only. Before v0.3.0 is tagged, the owner tests it on an HP ScanJet
+> Pro N4000 over USB and over the network (erp-sally
+> `docs/signed-copies/d1-d3-scanner-control.md`, Rollout step 4).
 
 Sally Desktop watches one scanner, scans whatever is put in its feeder, keeps
 every page safe on the PC, and sends the pages to Sally as one run per stack
@@ -205,6 +211,59 @@ page is checked to start with `FF D8` and is otherwise **never decoded or
 re-encoded**: scanners often end a JPEG a row short, which Go's decoder
 rejects, and the bytes go to Sally exactly as the scanner made them.
 
+**The scanner list.** Sally Desktop lists every scanner it can reach (USB
+on Windows, the typed address, and up to 32 mDNS adverts per pass, those
+seen before first) and refreshes the list every minute and on *Look again*,
+never while a pile scans; the open scanner is never probed by the list. A
+USB device is probed again only when it is new, relinked or failed more
+than 5 minutes ago, an answering network scanner every 5 minutes, and an
+entry unseen for 3 passes leaves the list unless it is the chosen one.
+Each scanner has an id, `sc-` + the first 20 hex characters of SHA-256
+over the first key that exists: the top-level `scan:UUID` of its
+capabilities, else its make and model plus top-level `pwg:SerialNumber`,
+else the mDNS TXT `UUID`, else the id that sighting last had from the
+capabilities, else a last resort (the USB device key, the mDNS label or
+the typed address) that can change after replugging or renaming and is
+reported with `stable: false`. Only top-level capability values count (the
+HP N4000 nests a certification `Version` 1.3 after its real `pwg:Version`
+2.9, and 0.3.0 posts 2.9). The interfaces of one USB device (`PI_00`,
+`PI_01`) are one sighting, and the HTTP and HTTPS adverts of one mDNS
+label and host are one sighting. Sightings with the same id are one entry,
+USB first: a scanner on USB and on the network shows once, as "USB and
+network", and is opened over USB. A scanner with no UUID or serial at all
+may show twice, once per transport. **An id is a label the device
+asserts, not proof of identity**: any host on the LAN can copy a UUID.
+
+**The scanner choice** lives on the PC, like the pause. *Automatic* (the
+default) is 0.2.0's pick: the first USB scanner that answers, else the
+typed address, else the first network scanner by name, kept until it stops
+answering. A scanner chosen on the status page's **Scanners** block, or
+from Sally (`SELECT_SCANNER`), is the only one opened; while it does not
+answer, Sally Desktop waits for it and never switches to another (choose
+Automatic for that). A change takes effect after the running pile. The
+page says who chose it: "Chosen in Sally by … at …" or "Chosen on this PC
+at …". A pick made on the page is reported to Sally for its activity log.
+
+**Stop this pile** (the status page's button, which asks twice, or `STOP`
+from Sally for the pile the person saw) takes effect between sheets: the
+agent checks before every `NextDocument`, never cancels a page in flight,
+and on a duplex scanner with a front received it fetches the back first
+(giving up after 10 s). It then sends the eSCL `DELETE` for the job (best
+effort; the answer goes to `agent.log`), drops an unpaired last front so a
+half-fed sheet is fed again whole, and keeps every whole sheet as a stack
+marked `ended: STOPPED` that goes up like any other: the partial stack.
+The page shows the Stop words in their own warning line ("Stopped after N
+sheets. They are safe on this PC. Put every sheet after them back on the
+pile…"), plays the low tone once, and shows no receipt or chime.
+
+**The hold after a Stop.** The rest of the pile is usually still in the
+feeder, so auto-start is held until the scanner reads idle with the feeder
+clear (`ScannerAdfEmpty`, or no feeder state at all); busy, a jam or an
+open cover do not lift it. Scan now on the PC still scans during the hold,
+and Sally's Scan now does after a Stop from Sally, but **not** after a Stop
+pressed on the PC ("Someone stopped this pile on the PC."): whoever is at
+the scanner finishes the pile. The next pile clears the hold.
+
 **Starting by itself.** A scan starts when paper has been in an idle feeder,
 continuously, for the start delay (2, 3 or 5 s from Sally; 3 by default). There
 is no "empty → loaded" edge to wait for, so it also starts after a paper jam
@@ -220,6 +279,10 @@ stuck sheet and put it back on top of the stack. Sally kept the N sheets
 already scanned and sets aside anything scanned twice." Once the scanner
 reports the jam cleared and the rest is back in the feeder, the next stack
 starts by itself. Sally's page fingerprints set aside a sheet scanned twice.
+A stack cut short is announced with `ended: JAM` (a jam), `STOPPED` (Stop
+this pile) or `ERROR` (anything else, including a stack recovered after the
+agent stopped mid-scan); a pile that ran to its end sends no `ended`. After
+a Stop, the jam words end "…then press Scan now to scan the rest".
 
 **The outbox.** Each side is written to disk the moment it arrives: sealed
 with DPAPI (user scope) on Windows, a `0600` file in a `0700` directory
@@ -296,17 +359,52 @@ outbox and shows why. Sally's address is `https://sallyerp.in` unless
 `sallyBaseUrl` in `config.json`, `SALLY_BASE_URL` or `-sally-url` says
 otherwise (plain http only to localhost).
 
-**Heartbeat and commands.** About every 10 s (Sally's `heartbeatSec`), and at
-once after a stack: scanner kind, name and state, feeder loaded, pause, outbox
-counts, version. Never page content. The answer carries the PC's settings and
-single-shot commands: `SCAN_NOW` and `TEST_SCAN` scan once as soon as paper is
-in an idle feeder (within two minutes), even while paused; `PAUSE` (15, 60 or
-until resumed) and `RESUME`. Unknown kinds are ignored. A `TEST_SCAN` is an
+**Heartbeat and commands.** About every 10 s (Sally's `heartbeatSec`), every
+5 s while a pile scans, a Scan now waits for paper or a Stop is pending, and
+at once after a stack or a change, but never twice within a second: scanner
+kind, name, id and state, feeder loaded, pause, outbox counts, version.
+Never page content. 0.3.0 adds (erp-sally
+`docs/signed-copies/p1-desktop-api.md`, "D1-D3"):
+
+- `features: ["COMMAND_RESULTS","STOP","SCANNERS"]`, a package variable
+  (`desktopFeatures`), never derived from the version: it is Sally's only
+  version gate;
+- `scanner.id`, `scanner.problem` (one of the agent's own fixed sentences,
+  never an error's raw text; that goes to `agent.log`), `scanner.held`
+  (`WHILE_PAUSED`, `AFTER_STOP`, `AFTER_STOP_ON_PC`) and `scanner.job` (the
+  running pile: id, kind, start, sides so far, stopping);
+- `scanners` (at most 16: the one in use, the chosen one, those seen in an
+  earlier pass, then USB, answering and by name; `[]` when there are none)
+  and `chosenScannerId` (`null` for automatic);
+- `commandResults` and `localActions` (Stop and scanner picks made on the
+  status page), each resent until a check-in answers 2xx.
+
+The answer carries the PC's settings and single-shot commands: `SCAN_NOW`
+and `TEST_SCAN` scan once as soon as paper is in an idle feeder (within two
+minutes), even with auto-start off; `PAUSE` (15, 60 or until resumed),
+`RESUME`, `STOP` (with the pile's `job`) and `SELECT_SCANNER` (with
+`scannerId`, `null` for automatic). **Every command gets a result**:
+`WAITING_FOR_PAPER`, `SCANNING`, `STOPPING`, then `DONE`, `STOPPED`,
+`NO_PAPER`, `NOTHING_TO_STOP` or `FAILED` with a plain sentence. Sally's Scan
+now is refused while the PC is paused ("This PC is paused.") or held after a
+Stop on the PC, and fails at once when no scanner is found; one that comes
+while a pile scans joins that pile; a pause cancels one still waiting ("The
+PC was paused before paper went in."); after two minutes without paper it
+is `NO_PAPER` (or says the scanner was jammed or not answering). A kind this
+version does not know is `FAILED` and changes nothing. A `TEST_SCAN` is an
 ordinary stack, uploaded like any other: the Setup wizard's "try one copy"
 watches for the next run from this PC.
 
+`scan.json` keeps, besides the pause and the per-PC switches, the choice
+(`scannerId`, `scannerName`, `scannerVia`, `scannerChosenBy`,
+`scannerChosenAt`) and `knownScanners` (at most 16 sighting → id pairs, so a
+scanner keeps its id while its capabilities do not answer). An older agent
+rewrites `scan.json` without them, so a downgrade to 0.2.0 loses the choice
+and the PC picks automatically.
+
 **Pause** from the status page or from Sally: 15 minutes, 1 hour, or until
-resumed. It survives a restart.
+resumed. It survives a restart, and cancels a Scan now still waiting for
+paper.
 
 **One copy scans.** Printing copes with a second copy (it binds the next port).
 Scanning cannot share a feeder, so only the copy holding the scanner lock (a
