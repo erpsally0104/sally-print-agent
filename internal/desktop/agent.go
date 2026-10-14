@@ -1297,6 +1297,11 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
 	a.mu.Unlock()
 	if !ok {
 		a.inventoryPass(ctx)
+		// This pass is not news to the wait below.
+		select {
+		case <-a.invDone:
+		default:
+		}
 		a.mu.Lock()
 		f, ok = a.foundLocked(chosen)
 		a.mu.Unlock()
