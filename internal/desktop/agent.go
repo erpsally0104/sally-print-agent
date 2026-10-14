@@ -272,7 +272,7 @@ func (a *Agent) Resume() {
 // ScanNow scans once as soon as paper is in an idle feeder.
 func (a *Agent) ScanNow() {
 	a.mu.Lock()
-	a.machine.Request(a.opt.Now(), autoscan.ScanNow)
+	a.machine.Request(a.opt.Now(), autoscan.ScanNow, "")
 	a.mu.Unlock()
 }
 
@@ -607,10 +607,10 @@ func (a *Agent) apply(r *sally.HeartbeatResponse) {
 	for _, c := range r.Commands {
 		switch c.Kind {
 		case "SCAN_NOW":
-			a.machine.Request(now, autoscan.ScanNow)
+			a.machine.Request(now, autoscan.ScanNow, c.ID)
 			a.logf("Sally asked for a scan now (%s)", c.ID)
 		case "TEST_SCAN":
-			a.machine.Request(now, autoscan.TestScan)
+			a.machine.Request(now, autoscan.TestScan, c.ID)
 			a.logf("Sally asked for a test scan (%s)", c.ID)
 		case "PAUSE":
 			minutes := 0

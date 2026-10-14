@@ -8,6 +8,7 @@ import (
 var (
 	idleLoaded = Observation{Reachable: true, Idle: true, Loaded: true}
 	idleEmpty  = Observation{Reachable: true, Idle: true}
+	idleClear  = Observation{Reachable: true, Idle: true, Clear: true}
 	busy       = Observation{Reachable: true, Loaded: true}
 	jammed     = Observation{Reachable: true, Idle: true} // AdfJam: not "loaded"
 	on3        = Settings{AutoStart: true, Delay: 3 * time.Second}
@@ -146,7 +147,7 @@ func TestPausedOrAutoStartOffNeverStarts(t *testing.T) {
 func TestScanNowWorksWhilePausedButOnlyOnce(t *testing.T) {
 	s := newSim(t)
 	s.feed(idleLoaded, 5, on3, true)
-	s.m.Request(s.now, ScanNow)
+	s.m.Request(s.now, ScanNow, "")
 	at, k := s.feed(idleLoaded, 1, on3, true)
 	if k != ScanNow || at != 1 {
 		t.Fatalf("scan now should start at once, got %d %s", at, k)
@@ -159,7 +160,7 @@ func TestScanNowWorksWhilePausedButOnlyOnce(t *testing.T) {
 
 func TestScanNowWaitsForPaperThenExpires(t *testing.T) {
 	s := newSim(t)
-	s.m.Request(s.now, TestScan)
+	s.m.Request(s.now, TestScan, "")
 	s.feed(idleEmpty, 10, Settings{}, false)
 	if s.m.Pending(s.now) != TestScan {
 		t.Fatal("the request should still be waiting for paper")
@@ -168,7 +169,7 @@ func TestScanNowWaitsForPaperThenExpires(t *testing.T) {
 		t.Fatal("test scan should start when paper arrives")
 	}
 	s.m.Ended()
-	s.m.Request(s.now, ScanNow)
+	s.m.Request(s.now, ScanNow, "")
 	s.feed(idleEmpty, 200, Settings{}, false)
 	if _, k := s.feed(idleLoaded, 1, Settings{}, false); k != None {
 		t.Fatal("an old request must not fire")
@@ -178,7 +179,7 @@ func TestScanNowWaitsForPaperThenExpires(t *testing.T) {
 func TestNothingStartsWhileAJobRuns(t *testing.T) {
 	s := newSim(t)
 	s.feed(idleLoaded, 4, on3, false) // started
-	s.m.Request(s.now, ScanNow)
+	s.m.Request(s.now, ScanNow, "")
 	if at, _ := s.feed(idleLoaded, 10, on3, false); at != 0 {
 		t.Fatal("started a second job while one runs")
 	}
@@ -197,5 +198,134 @@ func TestDefaultDelayIsThreeSeconds(t *testing.T) {
 	s := newSim(t)
 	if at, _ := s.feed(idleLoaded, 10, Settings{AutoStart: true}, false); at != 4 {
 		t.Fatalf("started at %d", at)
+	}
+}
+
+func TestTwoRequestsInOneWindowFireOnOneStart(t *testing.T) {
+	s := newSim(t)
+	s.m.Request(s.now, ScanNow, "c1")
+	s.feed(idleEmpty, 5, on3, false)
+	s.m.Request(s.now, ScanNow, "c2")
+	if _, k := s.feed(idleLoaded, 1, on3, false); k != ScanNow {
+		t.Fatal("should start")
+	}
+	if got := s.m.TakeFired(); len(got) != 2 || got[0] != "c1" || got[1] != "c2" {
+		t.Fatalf("fired %v", got)
+	}
+	if got := s.m.TakeFired(); len(got) != 0 {
+		t.Fatalf("taken twice: %v", got)
+	}
+}
+
+func TestALapsedRequestComesBackOnceEvenWithoutObserve(t *testing.T) {
+	s := newSim(t)
+	s.m.Request(s.now, ScanNow, "c1")
+	if got := s.m.TakeLapsed(s.now.Add(119 * time.Second)); len(got) != 0 {
+		t.Fatalf("lapsed early: %v", got)
+	}
+	if got := s.m.TakeLapsed(s.now.Add(121 * time.Second)); len(got) != 1 || got[0] != "c1" {
+		t.Fatalf("lapsed %v", got)
+	}
+	if got := s.m.TakeLapsed(s.now.Add(122 * time.Second)); len(got) != 0 {
+		t.Fatalf("lapsed twice: %v", got)
+	}
+	// Through Observe as well.
+	s.m.Request(s.now, TestScan, "c2")
+	s.feed(idleEmpty, 121, on3, false)
+	if got := s.m.TakeLapsed(s.now); len(got) != 1 || got[0] != "c2" {
+		t.Fatalf("lapsed %v", got)
+	}
+}
+
+func TestARequestAfterTheWindowLapsesTheOldIDs(t *testing.T) {
+	s := newSim(t)
+	s.m.Request(s.now, ScanNow, "old")
+	s.now = s.now.Add(3 * time.Minute)
+	s.m.Request(s.now, ScanNow, "new")
+	if got := s.m.TakeLapsed(s.now); len(got) != 1 || got[0] != "old" {
+		t.Fatalf("lapsed %v", got)
+	}
+	s.feed(idleLoaded, 1, on3, false)
+	if got := s.m.TakeFired(); len(got) != 1 || got[0] != "new" {
+		t.Fatalf("fired %v", got)
+	}
+}
+
+func TestCancelDropsTheWaitingRequest(t *testing.T) {
+	s := newSim(t)
+	s.m.Request(s.now, ScanNow, "c1")
+	s.m.Request(s.now, ScanNow, "")
+	s.m.Cancel()
+	if got := s.m.TakeCancelled(); len(got) != 2 || got[0] != "c1" {
+		t.Fatalf("cancelled %v", got)
+	}
+	if at, _ := s.feed(idleLoaded, 30, on3, true); at != 0 {
+		t.Fatal("a cancelled request fired")
+	}
+	if s.m.Pending(s.now) != None {
+		t.Fatal("still pending")
+	}
+}
+
+func TestTheHoldAfterAStopLiftsOnlyOnAClearFeeder(t *testing.T) {
+	for _, h := range []Hold{HoldAfterStop, HoldAfterStopOnPC} {
+		for name, clear := range map[string]Observation{
+			"feeder empty":    idleClear,
+			"no feeder state": {Reachable: true, Idle: true, Clear: true},
+		} {
+			s := newSim(t)
+			s.feed(idleLoaded, 4, on3, false)
+			s.m.Ended()
+			s.m.HoldUntilClear(h)
+			s.feed(busy, 2, on3, false)
+			if at, _ := s.feed(idleLoaded, 30, on3, false); at != 0 {
+				t.Fatalf("%s: started after busy", name)
+			}
+			s.feed(jammed, 2, on3, false)
+			s.feed(Observation{Reachable: true, Idle: true}, 2, on3, false) // door open
+			if at, _ := s.feed(idleLoaded, 30, on3, false); at != 0 {
+				t.Fatalf("%s: a jam or an open door lifted the hold", name)
+			}
+			s.feed(clear, 1, on3, false)
+			if s.m.Held() != "" {
+				t.Fatalf("%s: still held", name)
+			}
+			if at, k := s.feed(idleLoaded, 10, on3, false); k != Auto || at != 4 {
+				t.Fatalf("%s: got %d %s", name, at, k)
+			}
+		}
+	}
+}
+
+func TestScanNowFiresDuringAHoldAndEndedClearsIt(t *testing.T) {
+	for _, h := range []Hold{HoldAfterStop, HoldAfterStopOnPC} {
+		s := newSim(t)
+		s.feed(idleLoaded, 4, on3, false)
+		s.m.Ended()
+		s.m.HoldUntilClear(h)
+		s.m.Request(s.now, ScanNow, "c1")
+		if _, k := s.feed(idleLoaded, 1, on3, false); k != ScanNow {
+			t.Fatal("scan now must fire during a hold")
+		}
+		s.m.Ended()
+		if s.m.Held() != "" {
+			t.Fatalf("Ended must clear the hold: %q", s.m.Held())
+		}
+	}
+}
+
+func TestHeldNamesTheHold(t *testing.T) {
+	s := newSim(t)
+	s.feed(idleLoaded, 3, on3, true)
+	if s.m.Held() != "WHILE_PAUSED" {
+		t.Fatalf("%q", s.m.Held())
+	}
+	s.m.HoldUntilClear(HoldAfterStop)
+	if s.m.Held() != "AFTER_STOP" {
+		t.Fatalf("%q", s.m.Held())
+	}
+	s.m.HoldUntilClear(HoldAfterStopOnPC)
+	if s.m.Held() != "AFTER_STOP_ON_PC" {
+		t.Fatalf("%q", s.m.Held())
 	}
 }

@@ -15,6 +15,17 @@
 // empty, a jam, an open door, the scanner busy or unreachable). A job that
 // leaves paper in the tray (a misfeed the scanner gave up on) therefore waits
 // for the person to touch the scanner instead of retrying every 3 seconds.
+//
+// After a pile is stopped part-way (Stop this pile), the rest of the pile is
+// usually still in the feeder. The hold (HoldUntilClear) keeps it from
+// starting again by itself until the scanner has read idle with the feeder
+// clear; a busy moment, a jam or an open door does not lift it. Scan now
+// still scans during a hold.
+//
+// Manual requests carry ids (Sally's command ids, or "" for the status
+// page) so the agent can report what became of each: fired on a pile
+// (TakeFired), lapsed without paper (TakeLapsed) or cancelled by a pause
+// (TakeCancelled).
 package autoscan
 
 import "time"
@@ -35,7 +46,23 @@ type Observation struct {
 	Reachable bool
 	Idle      bool
 	Loaded    bool
+	// Clear: the feeder is empty, or the scanner reports no feeder state.
+	Clear bool
 }
+
+// Hold is why a loaded feeder is kept from starting by itself after a Stop.
+type Hold int
+
+const (
+	HoldNone Hold = iota
+	// HoldAfterStop: a pile was stopped from Sally.
+	HoldAfterStop
+	// HoldAfterStopOnPC: a pile was stopped on the PC's status page.
+	HoldAfterStopOnPC
+)
+
+// maxManualIDs bounds the ids one waiting request collects.
+const maxManualIDs = 20
 
 // Settings come from Sally on the heartbeat.
 type Settings struct {
@@ -64,17 +91,94 @@ type Machine struct {
 	// heldWhilePaused: paper sat in the feeder while starting was not
 	// allowed. Shown on the status page as "paper put in while paused".
 	heldWhilePaused bool
+	// manualIDs are the ids waiting on the manual request; fired, lapsed
+	// and cancelled hold ids until the agent takes them.
+	manualIDs []string
+	fired     []string
+	lapsed    []string
+	cancelled []string
+	// hold keeps auto-start off after a Stop until the feeder is clear.
+	hold Hold
 }
 
 // New returns a machine ready to start on the first idle-loaded period.
 func New() *Machine { return &Machine{armed: true} }
 
-// Request records a SCAN_NOW or TEST_SCAN. It scans once, as soon as there is
-// paper in an idle scanner, even while paused or with auto-start off.
-func (m *Machine) Request(now time.Time, k Kind) {
+// Request records a SCAN_NOW or TEST_SCAN with its id ("" from the status
+// page). It scans once, as soon as there is paper in an idle scanner, even
+// while paused, with auto-start off or during a hold. Requests made while
+// one waits join it, and the 2-minute window starts again; a request whose
+// window had already passed is lapsed first.
+func (m *Machine) Request(now time.Time, k Kind, id string) {
+	m.expire(now)
 	m.manual = k
 	m.manualUntil = now.Add(manualWindow)
+	m.manualIDs = append(m.manualIDs, id)
+	if n := len(m.manualIDs) - maxManualIDs; n > 0 {
+		m.lapsed = append(m.lapsed, m.manualIDs[:n]...)
+		m.manualIDs = append([]string(nil), m.manualIDs[n:]...)
+	}
 }
+
+// expire lapses a request whose window has passed.
+func (m *Machine) expire(now time.Time) {
+	if m.manual != None && !now.Before(m.manualUntil) {
+		m.lapsed = append(m.lapsed, m.manualIDs...)
+		m.manual, m.manualIDs = None, nil
+	}
+}
+
+// TakeFired returns the ids of the requests that started the current pile.
+func (m *Machine) TakeFired() []string {
+	out := m.fired
+	m.fired = nil
+	return out
+}
+
+// TakeLapsed returns the ids of requests whose 2 minutes passed without
+// paper, each once. It also lapses an expired request by itself, so the ids
+// come back even while nothing is observed.
+func (m *Machine) TakeLapsed(now time.Time) []string {
+	m.expire(now)
+	out := m.lapsed
+	m.lapsed = nil
+	return out
+}
+
+// Cancel drops the waiting request (a pause cancels a scan that has not
+// started); its ids go to TakeCancelled.
+func (m *Machine) Cancel() {
+	m.cancelled = append(m.cancelled, m.manualIDs...)
+	m.manual, m.manualIDs = None, nil
+}
+
+// TakeCancelled returns the ids Cancel dropped.
+func (m *Machine) TakeCancelled() []string {
+	out := m.cancelled
+	m.cancelled = nil
+	return out
+}
+
+// HoldUntilClear keeps auto-start off until the scanner reads idle with the
+// feeder clear. Call it after Ended.
+func (m *Machine) HoldUntilClear(h Hold) { m.hold = h }
+
+// Held says why paper in the feeder will not start by itself:
+// AFTER_STOP, AFTER_STOP_ON_PC, WHILE_PAUSED, or "".
+func (m *Machine) Held() string {
+	switch {
+	case m.hold == HoldAfterStop:
+		return "AFTER_STOP"
+	case m.hold == HoldAfterStopOnPC:
+		return "AFTER_STOP_ON_PC"
+	case m.heldWhilePaused:
+		return "WHILE_PAUSED"
+	}
+	return ""
+}
+
+// HoldKind is the current hold.
+func (m *Machine) HoldKind() Hold { return m.hold }
 
 // Pending reports a manual request still waiting for paper.
 func (m *Machine) Pending(now time.Time) Kind {
@@ -98,24 +202,32 @@ func (m *Machine) Observe(now time.Time, o Observation, s Settings, paused bool)
 	if m.running {
 		return None
 	}
-	if m.manual != None && !now.Before(m.manualUntil) {
-		m.manual = None
-	}
+	m.expire(now)
 
 	idleLoaded := o.Reachable && o.Idle && o.Loaded
 	if !idleLoaded {
 		// Anything else (empty, jam, door open, busy, unreachable) ends the
-		// period and lets the next one count.
+		// period and lets the next one count; during a hold, only an idle
+		// scanner with a clear feeder does.
 		m.since = time.Time{}
-		m.armed = true
 		m.heldWhilePaused = false
+		if m.hold == HoldNone {
+			m.armed = true
+		} else if o.Reachable && o.Idle && o.Clear {
+			m.hold = HoldNone
+			m.armed = true
+		}
 		return None
 	}
 
 	if m.manual != None {
 		k := m.manual
-		m.manual = None
+		m.fired = append(m.fired, m.manualIDs...)
+		m.manual, m.manualIDs = None, nil
 		return k
+	}
+	if m.hold != HoldNone {
+		return None
 	}
 
 	if paused || !s.AutoStart {
@@ -151,9 +263,10 @@ func (m *Machine) Started() {
 
 // Ended records that the job finished, failed or never began. Whatever the
 // outcome, the next scan needs a new idle-loaded period that begins after
-// something else has been seen.
+// something else has been seen. It clears a hold.
 func (m *Machine) Ended() {
 	m.running = false
+	m.hold = HoldNone
 	m.armed = false
 	m.since = time.Time{}
 	m.heldWhilePaused = false
