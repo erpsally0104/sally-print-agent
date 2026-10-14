@@ -35,6 +35,12 @@ type scanDesk interface {
 	SetKeepCopies(on bool)
 	SetScannerAddress(addr string) error
 	SetWatchedFolder(path string) error
+	// StopPile stops the running pile job after the current sheet;
+	// SelectScanner chooses the scanner ("" = automatic); LookAgain
+	// refreshes the scanner list.
+	StopPile(job string) error
+	SelectScanner(id string) error
+	LookAgain()
 }
 
 func (s *server) scanRoutes(mux *http.ServeMux) {
@@ -76,6 +82,25 @@ func (s *server) scanRoutes(mux *http.ServeMux) {
 		if err := d.SetScannerAddress(r.FormValue("address")); err != nil {
 			return errBadRequest(err.Error())
 		}
+		return nil
+	})))
+	// Stop this pile: the job id the page showed. A pile that is not the
+	// running one answers 400 "That pile has already finished."
+	mux.HandleFunc("/scan/stop", s.requireLocalControl(s.withDesk(func(d scanDesk, r *http.Request) error {
+		if err := d.StopPile(r.FormValue("job")); err != nil {
+			return errBadRequest(err.Error())
+		}
+		return nil
+	})))
+	// The scanner choice: an id from the list, or "" for automatic.
+	mux.HandleFunc("/scan/select", s.requireLocalControl(s.withDesk(func(d scanDesk, r *http.Request) error {
+		if err := d.SelectScanner(r.FormValue("id")); err != nil {
+			return errBadRequest(err.Error())
+		}
+		return nil
+	})))
+	mux.HandleFunc("/scan/look", s.requireLocalControl(s.withDesk(func(d scanDesk, _ *http.Request) error {
+		d.LookAgain()
 		return nil
 	})))
 	// The watched folder: a full path, or "" to stop watching (Clear).
@@ -140,7 +165,11 @@ func (s *server) handleStatusJSON(w http.ResponseWriter, _ *http.Request) {
 		},
 		"receipt": v.Receipt,
 		"problem": v.Problem,
-		"stamp":   statusStamp(v),
+		// What changes during a pile, updated in place without a reload.
+		"live": map[string]any{
+			"jobId": v.JobID, "sides": v.ScanSides, "stopping": v.StopRequested, "line": scannerLine(v),
+		},
+		"stamp": statusStamp(v),
 	}
 	if v.PausedUntil != nil {
 		body["pausedUntil"] = v.PausedUntil.UTC().Format(time.RFC3339)
@@ -149,7 +178,8 @@ func (s *server) handleStatusJSON(w http.ResponseWriter, _ *http.Request) {
 }
 
 // statusStamp changes whenever anything shown on the scanner card changes,
-// so the page reloads only then.
+// so the page reloads only then. The side count of a running pile is not
+// in it: the page updates that line in place from status.json's live part.
 func statusStamp(v desktop.View) string {
 	b := []byte{}
 	add := func(x string) { b = append(b, x...); b = append(b, '|') }
@@ -162,8 +192,13 @@ func statusStamp(v desktop.View) string {
 		add(v.Pairing.UserCode + v.Pairing.Err + strconv.FormatBool(v.Pairing.Waiting))
 	}
 	add(v.ScannerKind + v.ScannerName + v.ScannerState)
-	add(strconv.FormatBool(v.AdfLoaded) + strconv.FormatBool(v.ScanRunning) + strconv.Itoa(v.ScanSides))
-	add(strconv.FormatBool(v.Paused) + strconv.FormatBool(v.HeldWhilePaused) + v.Pending)
+	add(strconv.FormatBool(v.AdfLoaded) + strconv.FormatBool(v.ScanRunning) + v.JobID)
+	add(strconv.FormatBool(v.Paused) + strconv.FormatBool(v.HeldWhilePaused) + v.Pending + strconv.FormatBool(v.PendingFromSally))
+	add(v.ScannerID + "/" + v.HoldState + "/" + v.Stopped + "/" + v.StoppedBy)
+	add(v.ChosenID + "/" + v.ChosenName + "/" + v.ChosenBy + "/" + strconv.FormatBool(v.ChosenMissing))
+	for _, r := range v.Scanners {
+		add(r.ID + r.Name + r.Kind + r.Detail + strconv.FormatBool(r.Answering) + strconv.FormatBool(r.InUse) + strconv.FormatBool(r.Chosen))
+	}
 	add(strconv.FormatBool(v.AutoStart) + strconv.Itoa(v.StartDelaySec))
 	add(v.Receipt + v.Problem)
 	add(strconv.Itoa(v.StacksWaiting) + "/" + strconv.Itoa(v.SidesWaiting) + "/" + strconv.Itoa(v.SendingSent) + "/" + strconv.Itoa(v.SendingTotal))
@@ -225,6 +260,26 @@ type scanCard struct {
 	// today; FolderErrorWhen is when its last problem was.
 	FolderLine      string
 	FolderErrorWhen string
+	// StoppedLine says who stopped the pile from Sally, and when.
+	StoppedLine string
+	// HoldLine is the hold after a Stop.
+	HoldLine string
+	// PendingLine is the note while a Scan now waits for paper.
+	PendingLine string
+	// ChosenLine says who chose the scanner and when; ScannerRows are the
+	// Scanners block's choices.
+	ChosenLine  string
+	ScannerRows []scannerRow
+	// AutoChosen: no scanner is chosen (Automatic).
+	AutoChosen bool
+}
+
+// scannerRow is one choice in the Scanners block.
+type scannerRow struct {
+	ID      string
+	Name    string
+	Tags    string
+	Checked bool
 }
 
 func clock(t time.Time) string {
@@ -278,36 +333,14 @@ func (s *server) scanCard() scanCard {
 		c.SendingLine = "Everything scanned is with Sally."
 	}
 
-	kind := map[string]string{"USB": "USB", "NETWORK": "network"}[v.ScannerKind]
-	state := ""
+	c.ScannerLine = scannerLine(v)
 	c.Dot = "warn"
 	switch {
+	case v.ChosenMissing:
 	case v.ScannerKind == "NONE" || v.ScannerKind == "":
-		state = "No scanner found. Connect it by USB, or type a network scanner's address below."
 		c.Dot = ""
-	case v.ScanRunning:
-		state = fmt.Sprintf("Scanning · %d %s so far", v.ScanSides, pagesWord(v.ScanSides))
+	case v.ScanRunning || v.ScannerState == "IDLE" || v.ScannerState == "PROCESSING":
 		c.Dot = "ok"
-	case v.ScannerState == "IDLE":
-		state = "Ready for the next stack"
-		if v.AdfLoaded {
-			state = "Paper in the feeder"
-		}
-		c.Dot = "ok"
-	case v.ScannerState == "JAMMED":
-		state = "Paper jam or cover open"
-	case v.ScannerState == "PROCESSING":
-		state = "Busy"
-		c.Dot = "ok"
-	case v.ScannerState == "OFFLINE":
-		state = "Not answering"
-	default:
-		state = "Checking…"
-	}
-	if v.ScannerName != "" {
-		c.ScannerLine = v.ScannerName + " · " + kind + " · " + state
-	} else {
-		c.ScannerLine = state
 	}
 
 	if v.AutoStart {
@@ -323,6 +356,55 @@ func (s *server) scanCard() scanCard {
 		c.PausedLine += " Paper put in now isn't sent to Sally."
 	} else if v.HeldWhilePaused {
 		c.AutoLine += " The paper in the feeder went in while paused: take it out and put it back, or press Scan now."
+	}
+
+	if v.Stopped != "" && v.StoppedFromSally {
+		c.StoppedLine = "Stopped from Sally at " + clock(v.StoppedAt) + "."
+		if v.StoppedBy != "" {
+			c.StoppedLine = "Stopped from Sally by " + v.StoppedBy + " at " + clock(v.StoppedAt) + "."
+		}
+	}
+	if (v.HoldState == "AFTER_STOP" || v.HoldState == "AFTER_STOP_ON_PC") && v.Stopped == "" {
+		c.HoldLine = "The pile was stopped. Take it out, or press Scan now to scan the rest."
+	}
+	if v.Pending != "" {
+		c.PendingLine = "Waiting for paper in the feeder to scan once."
+		if v.PendingFromSally {
+			c.PendingLine = "Sally asked for a scan. Waiting for paper until " + clock(v.PendingUntil) + "."
+		}
+	}
+	c.AutoChosen = v.ChosenID == ""
+	if v.ChosenAt != nil && !c.AutoChosen {
+		if v.ChosenBy == "PC" {
+			c.ChosenLine = "Chosen on this PC at " + clock(*v.ChosenAt) + "."
+		} else if v.ChosenBy != "" {
+			c.ChosenLine = "Chosen in Sally by " + v.ChosenBy + " at " + clock(*v.ChosenAt) + "."
+		} else {
+			c.ChosenLine = "Chosen in Sally at " + clock(*v.ChosenAt) + "."
+		}
+	}
+	for _, r := range v.Scanners {
+		var tags []string
+		if r.Kind != "" {
+			tags = append(tags, r.Kind)
+		}
+		if r.InUse {
+			tags = append(tags, "in use")
+		}
+		if !r.Answering {
+			tags = append(tags, "not answering")
+		}
+		if r.Feeder != nil && !*r.Feeder {
+			tags = append(tags, "no document feeder")
+		}
+		if !r.Stable {
+			tags = append(tags, "may change after replugging")
+		}
+		name := r.Name
+		if r.Detail != "" {
+			name += " (" + r.Detail + ")"
+		}
+		c.ScannerRows = append(c.ScannerRows, scannerRow{ID: r.ID, Name: name, Tags: strings.Join(tags, " · "), Checked: r.Chosen})
 	}
 
 	for _, r := range v.Recent {
@@ -344,6 +426,46 @@ func (s *server) scanCard() scanCard {
 		c.RefusedRows = append(c.RefusedRows, fmt.Sprintf("Stack %s: Sally refused it — %s; its pages are kept on this PC.", clock(r.At), r.Refused))
 	}
 	return c
+}
+
+// scannerLine is the scanner's line on the card: its name, how it is
+// reached and what it is doing.
+func scannerLine(v desktop.View) string {
+	if v.ChosenMissing {
+		name := v.ChosenName
+		if name == "" {
+			name = "The chosen scanner"
+		}
+		return name + " is not answering. Sally Desktop waits for it and does not switch to another scanner. Choose Automatic to use whichever scanner answers."
+	}
+	kind := map[string]string{"USB": "USB", "NETWORK": "network"}[v.ScannerKind]
+	state := ""
+	switch {
+	case v.ScannerKind == "NONE" || v.ScannerKind == "":
+		state = "No scanner found. Connect it by USB, or type a network scanner's address below."
+	case v.ScanRunning:
+		state = fmt.Sprintf("Scanning · %d %s so far", v.ScanSides, pagesWord(v.ScanSides))
+		if v.StopRequested {
+			state += " · stopping after this sheet"
+		}
+	case v.ScannerState == "IDLE":
+		state = "Ready for the next stack"
+		if v.AdfLoaded {
+			state = "Paper in the feeder"
+		}
+	case v.ScannerState == "JAMMED":
+		state = "Paper jam or cover open"
+	case v.ScannerState == "PROCESSING":
+		state = "Busy"
+	case v.ScannerState == "OFFLINE":
+		state = "Not answering"
+	default:
+		state = "Checking…"
+	}
+	if v.ScannerName != "" {
+		return v.ScannerName + " · " + kind + " · " + state
+	}
+	return state
 }
 
 func pagesWord(n int) string { return plural2(n, "page", "pages") }

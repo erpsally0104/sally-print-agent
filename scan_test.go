@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sallyerp/sally-print-agent/internal/desktop"
 	"github.com/sallyerp/sally-print-agent/internal/outbox"
@@ -34,6 +35,22 @@ func (f *fakeDesk) SetWatchedFolder(p string) error {
 	return nil
 }
 
+func (f *fakeDesk) StopPile(job string) error {
+	if job != f.view.JobID || job == "" {
+		return errBadRequest("That pile has already finished.")
+	}
+	f.calls = append(f.calls, "stop:"+job)
+	return nil
+}
+func (f *fakeDesk) SelectScanner(id string) error {
+	if id != "" && !strings.HasPrefix(id, "sc-") {
+		return errBadRequest("That scanner is not on this PC's list.")
+	}
+	f.calls = append(f.calls, "select:"+id)
+	return nil
+}
+func (f *fakeDesk) LookAgain() { f.calls = append(f.calls, "look") }
+
 func itoa(n int) string {
 	return map[int]string{0: "0", 15: "15", 60: "60"}[n]
 }
@@ -47,6 +64,7 @@ func boolStr(b bool) string {
 func scanServer(t *testing.T) (*server, *fakeDesk) {
 	s, _ := newTestServer(t, nil, nil)
 	d := &fakeDesk{view: desktop.View{
+		JobID:    "j20261014T091502-3f9a",
 		Scanning: true, Paired: true, CompanyName: "Alpha Traders",
 		ScannerKind: "USB", ScannerName: "HP ScanJet Pro N4000 snw1", ScannerState: "IDLE",
 		Receipt: "Got 48 sheets. Safe on this PC.", SendingTotal: 65, SendingSent: 31, StacksWaiting: 1, SidesWaiting: 34,
@@ -87,6 +105,10 @@ func TestScannerControlsWorkFromTheStatusPage(t *testing.T) {
 		{"/scan/scanner", "address=192.168.1.20", "addr:192.168.1.20"},
 		{"/scan/folder", "path=C%3A%5CUsers%5CAsha%5CScans", "folder:C:\\Users\\Asha\\Scans"},
 		{"/scan/folder", "path=", "folder:"},
+		{"/scan/stop", "job=j20261014T091502-3f9a", "stop:j20261014T091502-3f9a"},
+		{"/scan/select", "id=sc-0123456789abcdef0123", "select:sc-0123456789abcdef0123"},
+		{"/scan/select", "id=", "select:"},
+		{"/scan/look", "", "look"},
 	} {
 		rec := serve(s, control(s, c.path, c.body))
 		if rec.Code != http.StatusOK {
@@ -121,18 +143,26 @@ func TestNoWebPageCanUseTheScannerControls(t *testing.T) {
 		"a GET":                  func(r *http.Request) { r.Method = http.MethodGet },
 		"a token in a form only": func(r *http.Request) { r.Header.Del(csrfHeader); r.URL.RawQuery = "X-Sally-CSRF=" + s.csrf },
 	}
+	paths := map[string]string{
+		"/scan/pause": "minutes=15", "/scan/resume": "", "/scan/now": "", "/scan/connect": "",
+		"/scan/sounds": "on=true", "/scan/keep": "on=true", "/scan/scanner": "address=192.168.1.20",
+		"/scan/folder": "path=%2Ftmp", "/scan/stop": "job=j20261014T091502-3f9a",
+		"/scan/select": "id=sc-0123456789abcdef0123", "/scan/look": "",
+	}
 	for name, mutate := range cases {
-		t.Run(name, func(t *testing.T) {
-			req := control(s, "/scan/now", "")
-			mutate(req)
-			rec := serve(s, req)
-			if rec.Code == http.StatusOK {
-				t.Fatalf("accepted (%d)", rec.Code)
-			}
-			if rec.Header().Get("Access-Control-Allow-Origin") != "" {
-				t.Fatal("scanner routes must never answer CORS")
-			}
-		})
+		for path, body := range paths {
+			t.Run(name+" "+path, func(t *testing.T) {
+				req := control(s, path, body)
+				mutate(req)
+				rec := serve(s, req)
+				if rec.Code == http.StatusOK {
+					t.Fatalf("accepted (%d)", rec.Code)
+				}
+				if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+					t.Fatal("scanner routes must never answer CORS")
+				}
+			})
+		}
 	}
 	if len(d.calls) != 0 {
 		t.Fatalf("a refused request reached the scanner: %v", d.calls)
@@ -200,7 +230,7 @@ func TestStatusPageShowsTheScannerCard(t *testing.T) {
 		"Got 48 sheets. Safe on this PC.",
 		"Sending 65 pages to Sally · 31 sent",
 		"HP ScanJet Pro N4000 snw1 · USB · Ready for the next stack",
-		"Pause 15 min", "Pause 1 hour", "Pause until I resume",
+		"Pause 15 min", "Pause 1 hour", "Pause until resumed",
 		"Play sounds", "Keep a copy",
 	} {
 		if !strings.Contains(page, want) {
@@ -388,5 +418,126 @@ func TestStatusPageShowsTheWatchedFolder(t *testing.T) {
 	body := serve(s, req).Body.String()
 	if strings.Contains(body, "Asha") || !strings.Contains(body, `"sentToday":3`) {
 		t.Fatalf("status JSON %s", body)
+	}
+}
+
+func TestAStopForAnotherPileAnswers400(t *testing.T) {
+	s, d := scanServer(t)
+	rec := serve(s, control(s, "/scan/stop", "job=j20261014T091502-0000"))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "That pile has already finished.") {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if rec := serve(s, control(s, "/scan/select", "id=nonsense")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("select: %d", rec.Code)
+	}
+	if len(d.calls) != 0 {
+		t.Fatalf("%v", d.calls)
+	}
+}
+
+func page(s *server) string {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "127.0.0.1:17777"
+	return serve(s, req).Body.String()
+}
+
+func TestTheStatusPageStopAndScannerList(t *testing.T) {
+	s, d := scanServer(t)
+	if strings.Contains(page(s), `data-post="/scan/stop"`) {
+		t.Fatal("Stop shows only while a pile scans")
+	}
+	d.view.ScanRunning, d.view.ScanSides, d.view.StopRequested = true, 7, true
+	p := page(s)
+	for _, want := range []string{
+		`data-post="/scan/stop" data-job="j20261014T091502-3f9a">Stop this pile</button>`,
+		"Press again to stop. The sheets already scanned are kept.",
+		"Scanning · 7 pages so far · stopping after this sheet",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+	// The list: names escaped, tags, the choice.
+	at := time.Date(2026, 10, 14, 9, 30, 0, 0, time.UTC)
+	no := false
+	d.view.ScanRunning = false
+	d.view.Scanners = []desktop.ScannerRow{
+		{ID: "sc-0123456789abcdef0123", Name: "Front desk <script>alert(1)</script>", Kind: "USB and network", Answering: true, Stable: true, InUse: true, Chosen: true},
+		{ID: "sc-aaaaaaaaaaaaaaaaaaaa", Name: "Back office", Detail: "Back office [0B0B0B]", Kind: "network", Feeder: &no},
+	}
+	d.view.ChosenID, d.view.ChosenBy, d.view.ChosenAt = "sc-0123456789abcdef0123", "Dana Field", &at
+	p = page(s)
+	if strings.Contains(p, "<script>alert(1)") || !strings.Contains(p, "Front desk &lt;script&gt;") {
+		t.Fatal("a scanner name must be escaped")
+	}
+	for _, want := range []string{
+		"Scanners", "Automatic: the USB scanner first",
+		`value="sc-0123456789abcdef0123" checked`, "USB and network · in use",
+		"Back office (Back office [0B0B0B])", "network · not answering · no document feeder · may change after replugging",
+		"Use this scanner", "Look again", "Chosen in Sally by Dana Field at ",
+		"Add a network scanner by its address", "Add this address",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+	d.view.ChosenBy = "PC"
+	if !strings.Contains(page(s), "Chosen on this PC at ") {
+		t.Error("a choice made here says so")
+	}
+	// A chosen scanner that is not answering.
+	d.view.ChosenMissing, d.view.ChosenName = true, "Back office"
+	if !strings.Contains(page(s), "Back office is not answering. Sally Desktop waits for it and does not switch to another scanner.") {
+		t.Error("the missing-scanner words")
+	}
+}
+
+func TestTheStopWordsAreAWarningNotAReceipt(t *testing.T) {
+	s, d := scanServer(t)
+	d.view.Receipt = ""
+	d.view.Stopped = "Stopped after 2 sheets. They are safe on this PC. Put every sheet after them back on the pile; if you are not sure, put back a few more: Sally sets aside any sheet it already has. Then press Scan now to scan the rest, or take the pile out."
+	d.view.StoppedFromSally, d.view.StoppedBy, d.view.StoppedAt = true, "Dana Field", time.Date(2026, 10, 14, 9, 30, 0, 0, time.UTC)
+	p := page(s)
+	if !strings.Contains(p, `<p class="problem" id="stopped-line">Stopped after 2 sheets.`) || !strings.Contains(p, "Stopped from Sally by Dana Field at ") {
+		t.Fatal("the Stop words")
+	}
+	if strings.Contains(p, `class="receipt"`) || strings.Contains(p, "You can take the paper out") {
+		t.Fatal("the Stop words must not look like a receipt")
+	}
+	d.view.Stopped, d.view.HoldState = "", "AFTER_STOP_ON_PC"
+	if !strings.Contains(page(s), "The pile was stopped. Take it out, or press Scan now to scan the rest.") {
+		t.Fatal("the hold line")
+	}
+	d.view.Pending, d.view.PendingFromSally, d.view.PendingUntil = "SCAN_NOW", true, time.Date(2026, 10, 14, 9, 32, 0, 0, time.UTC)
+	if !strings.Contains(page(s), "Sally asked for a scan. Waiting for paper until ") {
+		t.Fatal("the Sally-asked note")
+	}
+}
+
+func TestTheStampIgnoresTheSideCountButNotTheList(t *testing.T) {
+	v := desktop.View{ScanRunning: true, JobID: "j1", ScanSides: 3, Scanners: []desktop.ScannerRow{{ID: "sc-1", Answering: true}}}
+	base := statusStamp(v)
+	v.ScanSides = 9
+	if statusStamp(v) != base {
+		t.Fatal("the side count must not reload the page")
+	}
+	v.Scanners = []desktop.ScannerRow{{ID: "sc-1", Answering: false}}
+	if statusStamp(v) == base {
+		t.Fatal("an answering flag must change the stamp")
+	}
+	v.Scanners[0].Answering = true
+	v.ChosenID = "sc-1"
+	if statusStamp(v) == base {
+		t.Fatal("the choice must change the stamp")
+	}
+
+	s, d := scanServer(t)
+	d.view.ScanRunning, d.view.ScanSides = true, 5
+	req := httptest.NewRequest(http.MethodGet, "/status.json", nil)
+	req.Host = "127.0.0.1:17777"
+	req.Header.Set(localHeader, "1")
+	body := serve(s, req).Body.String()
+	if !strings.Contains(body, `"live":{"jobId":"j20261014T091502-3f9a","line":`) || !strings.Contains(body, `"sides":5,"stopping":false}`) {
+		t.Fatalf("live %s", body)
 	}
 }

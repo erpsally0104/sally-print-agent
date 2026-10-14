@@ -209,6 +209,11 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
         <p class="note">{{.ReceiptWhen}} &middot; You can take the paper out.</p>
       {{end}}
       {{if .Problem}}<p class="problem">{{.Problem}}</p>{{end}}
+      {{if .Stopped}}
+        <p class="problem" id="stopped-line">{{.Stopped}}</p>
+        {{if .StoppedLine}}<p class="note">{{.StoppedLine}}</p>{{end}}
+      {{end}}
+      {{if .HoldLine}}<p class="warn">{{.HoldLine}}</p>{{end}}
       {{range .RefusedRows}}<p class="problem">{{.}}</p>{{end}}
       {{if .HeldLine}}<p class="note">{{.HeldLine}}</p>{{end}}
       {{if .SendingLine}}
@@ -217,7 +222,7 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
       {{end}}
       {{if .Offline}}<p class="note">{{.Offline}} Pages stay safe on this PC and go up when the internet is back.</p>{{end}}
 
-      <p style="margin-top:14px"><span class="dot {{.Dot}}"></span>{{.ScannerLine}}</p>
+      <p style="margin-top:14px"><span class="dot {{.Dot}}"></span><span id="scan-line">{{.ScannerLine}}</span></p>
       <p class="note">{{.AutoLine}}</p>
 
       {{if .Paused}}
@@ -225,16 +230,19 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
         <div class="row">
           <button type="button" data-post="/scan/resume">Resume</button>
           <button type="button" data-post="/scan/now">Scan it now</button>
+          {{if .ScanRunning}}<button type="button" id="stop-pile" data-post="/scan/stop" data-job="{{.JobID}}">Stop this pile</button>{{end}}
         </div>
       {{else}}
         <div class="row">
           <button type="button" data-post="/scan/now">Scan now</button>
           <button type="button" data-post="/scan/pause" data-minutes="15">Pause 15 min</button>
           <button type="button" data-post="/scan/pause" data-minutes="60">Pause 1 hour</button>
-          <button type="button" data-post="/scan/pause" data-minutes="0">Pause until I resume</button>
+          <button type="button" data-post="/scan/pause" data-minutes="0">Pause until resumed</button>
+          {{if .ScanRunning}}<button type="button" id="stop-pile" data-post="/scan/stop" data-job="{{.JobID}}">Stop this pile</button>{{end}}
         </div>
       {{end}}
-      {{if .Pending}}<p class="note">Waiting for paper in the feeder to scan once.</p>{{end}}
+      {{if .ScanRunning}}<p class="note" id="stop-note" hidden>Press again to stop. The sheets already scanned are kept.</p>{{end}}
+      {{if .PendingLine}}<p class="note">{{.PendingLine}}</p>{{end}}
 
       {{if .Rows}}
         <h2 style="margin-top:18px">Stacks</h2>
@@ -244,9 +252,24 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
       <h2 style="margin-top:18px">On this PC</h2>
       <label><input type="checkbox" data-toggle="/scan/sounds" {{if .SoundsOn}}checked{{end}}> Play sounds</label>
       <label><input type="checkbox" data-toggle="/scan/keep" {{if .KeepCopies}}checked{{end}}> Keep a copy of each page for 7 days after Sally has it</label>
+      <h2 style="margin-top:18px">Scanners</h2>
+      <form id="scanner-pick">
+        <label><input type="radio" name="scanner" value="" {{if .AutoChosen}}checked{{end}}> Automatic: the USB scanner first, then the address below, then the first network scanner found. It keeps that one until it stops answering.</label>
+        {{range .ScannerRows}}
+          <label><input type="radio" name="scanner" value="{{.ID}}" {{if .Checked}}checked{{end}}> {{.Name}}{{if .Tags}} <span class="tag">{{.Tags}}</span>{{end}}</label>
+        {{else}}
+          <p class="note">No scanner found yet. Connect one by USB, or add a network scanner by its address below.</p>
+        {{end}}
+        <div class="row">
+          <button type="submit">Use this scanner</button>
+          <button type="button" id="scanner-look">Look again</button>
+        </div>
+      </form>
+      {{if .ChosenLine}}<p class="note">{{.ChosenLine}}</p>{{end}}
+      <p class="note" style="margin-top:12px">Add a network scanner by its address</p>
       <form class="row" id="scanner-address">
-        <input type="text" name="address" placeholder="Network scanner IP, e.g. 192.168.1.20" value="{{.ScannerAddress}}" autocomplete="off">
-        <button type="submit">Use this scanner</button>
+        <input type="text" name="address" aria-label="Add a network scanner by its address" placeholder="Network scanner IP, e.g. 192.168.1.20" value="{{.ScannerAddress}}" autocomplete="off">
+        <button type="submit">Add this address</button>
       </form>
       <p class="note">A scanner on USB is found by itself; network scanners usually are too. Type an address only if yours is not.
       Pages waiting to go up are kept in <code>{{.OutboxDir}}</code>{{if .Encrypted}}, encrypted for your Windows account{{else}}, readable only by your user account{{end}}.</p>
@@ -372,15 +395,57 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
       throw new Error(body.error || 'that did not work');
     }
   }
+  // Stop this pile asks twice: the first click arms it as "Stop now" for
+  // 5 seconds, the second posts the pile the page showed.
+  var stopArmed = false;
+  var stopNote = document.getElementById('stop-note');
+  function disarm(b) {
+    clearTimeout(b.disarmTimer);
+    stopArmed = false;
+    b.textContent = 'Stop this pile';
+    if (stopNote) stopNote.hidden = true;
+  }
   document.querySelectorAll('[data-post]').forEach(function (b) {
     b.addEventListener('click', async function () {
-      this.disabled = true;
       var f = {};
+      if (this.dataset.job !== undefined) {
+        if (!stopArmed) {
+          var self = this;
+          stopArmed = true;
+          this.textContent = 'Stop now';
+          if (stopNote) stopNote.hidden = false;
+          this.disarmTimer = setTimeout(function () { disarm(self); }, 5000);
+          return;
+        }
+        disarm(this);
+        f.job = this.dataset.job;
+      }
+      this.disabled = true;
       if (this.dataset.minutes) f.minutes = this.dataset.minutes;
       try { await post(this.dataset.post, f); location.reload(); }
       catch (e) { this.disabled = false; this.textContent = 'Failed \u2014 ' + e.message; }
     });
   });
+  // The scanner choice: a pick not yet saved holds the page still.
+  var pick = document.getElementById('scanner-pick');
+  var pickDirty = false;
+  if (pick) {
+    pick.addEventListener('change', function () { pickDirty = true; });
+    pick.addEventListener('submit', async function (ev) {
+      ev.preventDefault();
+      var c = pick.querySelector('input[name=scanner]:checked');
+      try { await post('/scan/select', { id: c ? c.value : '' }); pickDirty = false; location.reload(); }
+      catch (e) { alert(e.message); }
+    });
+  }
+  var look = document.getElementById('scanner-look');
+  if (look) {
+    look.addEventListener('click', async function () {
+      this.disabled = true;
+      try { await post('/scan/look', {}); this.textContent = 'Looking\u2026'; }
+      catch (e) { this.disabled = false; alert(e.message); }
+    });
+  }
   document.querySelectorAll('[data-toggle]').forEach(function (c) {
     c.addEventListener('change', async function () {
       try { await post(this.dataset.toggle, { on: this.checked ? 'true' : 'false' }); }
@@ -410,18 +475,31 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!doctype html>
       catch (e) { alert(e.message); }
     });
   }
-  // Refresh when anything on the scanner card changes, but never while
-  // someone is typing.
+  // The running pile's line and the Stop button's pile update in place on
+  // every poll. The page reloads only when something else on the scanner
+  // card changes, and never while someone is typing, picking a scanner or
+  // has Stop armed.
+  function holdStill() {
+    var a = document.activeElement;
+    if (a && a.tagName === 'INPUT' && a.type === 'text') return true;
+    if (stopArmed || pickDirty) return true;
+    return !!(pick && a && pick.contains(a));
+  }
   var stamp = null;
   setInterval(async function () {
     try {
       var res = await fetch('/status.json', { headers: { 'X-Sally-Local': '1' } });
       if (!res.ok) return;
       var s = await res.json();
+      if (s.live && s.live.jobId) {
+        var line = document.getElementById('scan-line');
+        if (line) line.textContent = s.live.line;
+        var sb = document.getElementById('stop-pile');
+        if (sb) sb.dataset.job = s.live.jobId;
+      }
       if (stamp !== null && s.stamp !== stamp) {
-        var a = document.activeElement;
-        if (!a || a.tagName !== 'INPUT' || a.type !== 'text') location.reload();
-        else return;
+        if (holdStill()) return;
+        location.reload();
       }
       stamp = s.stamp;
     } catch (e) {}
