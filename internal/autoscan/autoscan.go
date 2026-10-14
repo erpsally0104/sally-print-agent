@@ -188,6 +188,13 @@ func (m *Machine) Pending(now time.Time) Kind {
 	return None
 }
 
+// Waiting returns the ids of the request waiting for paper ("" for the
+// status page's).
+func (m *Machine) Waiting() []string { return append([]string(nil), m.manualIDs...) }
+
+// PendingUntil is when the waiting request gives up.
+func (m *Machine) PendingUntil() time.Time { return m.manualUntil }
+
 // HeldWhilePaused reports paper sitting in the feeder that will not be sent
 // because starting is not allowed (paused or auto-start off).
 func (m *Machine) HeldWhilePaused() bool { return m.heldWhilePaused }

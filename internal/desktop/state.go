@@ -39,7 +39,26 @@ type local struct {
 	// the PC rebooted.
 	PausedForever bool       `json:"pausedForever,omitempty"`
 	PausedUntil   *time.Time `json:"pausedUntil,omitempty"`
+
+	// The scanner choice lives on the PC (like the pause): ScannerID is the
+	// chosen scanner's id ("" = automatic), ScannerName and ScannerVia what
+	// it was last called and how it was reached, ScannerChosenBy "PC" or the
+	// name of the person who chose it in Sally, and ScannerChosenAt when.
+	ScannerID       string     `json:"scannerId,omitempty"`
+	ScannerName     string     `json:"scannerName,omitempty"`
+	ScannerVia      []string   `json:"scannerVia,omitempty"`
+	ScannerChosenBy string     `json:"scannerChosenBy,omitempty"`
+	ScannerChosenAt *time.Time `json:"scannerChosenAt,omitempty"`
+
+	// KnownScanners maps a sighting (a USB device key, an mDNS label and
+	// host, or a typed address) to the id its capabilities last gave, so a
+	// scanner keeps its id while its capabilities do not answer. At most
+	// maxKnownScanners; the least recently seen is dropped.
+	KnownScanners map[string]string `json:"knownScanners,omitempty"`
 }
+
+// maxKnownScanners bounds KnownScanners.
+const maxKnownScanners = 16
 
 func loadLocal(path string) (local, error) {
 	var l local

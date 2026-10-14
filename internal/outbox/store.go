@@ -103,7 +103,7 @@ type Manifest struct {
 	// EndedError (anything else, including a stack recovered after the
 	// agent stopped mid-scan). Empty for a pile that ran to its end.
 	Ended string `json:"ended,omitempty"`
-	RunID   string `json:"runId,omitempty"`
+	RunID string `json:"runId,omitempty"`
 	// Done: Sally acknowledged /done; nothing more to send.
 	Done bool `json:"done"`
 	// Refused: Sally answered this stack in a way that can never clear

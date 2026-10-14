@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sallyerp/sally-print-agent/internal/autoscan"
 	"github.com/sallyerp/sally-print-agent/internal/escl"
 	"github.com/sallyerp/sally-print-agent/internal/sound"
 )
@@ -24,6 +23,7 @@ func newAgent(t *testing.T, baseURL string, disc Discoverer) *Agent {
 	a, err := New(Options{
 		Dir: t.TempDir(), BaseURL: baseURL, Version: "1.1.0-test",
 		Discover: disc, PollEvery: 10 * time.Millisecond, Scanning: true,
+		Look: noLook,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -31,6 +31,9 @@ func newAgent(t *testing.T, baseURL string, disc Discoverer) *Agent {
 	a.local.SoundsOff = true
 	return a
 }
+
+// noLook finds nothing: tests never browse the real LAN.
+func noLook(context.Context, string, Skip, map[string]string, func(string, ...any)) []Found { return nil }
 
 func pairedAgent(t *testing.T, baseURL string, disc Discoverer) *Agent {
 	a := newAgent(t, baseURL, disc)
@@ -58,6 +61,7 @@ func TestHeartbeatAppliesSettingsAndCommandsInOrder(t *testing.T) {
 	}))
 	defer srv.Close()
 	a := pairedAgent(t, srv.URL, nil)
+	a.scannerOpen = true // a scanner is open, so Scan now waits for paper
 	a.heartbeatOnce(context.Background())
 
 	if got["agentVersion"] != "1.1.0-test" || got["pause"] == nil || got["outbox"] == nil || got["scanner"] == nil {
@@ -70,8 +74,21 @@ func TestHeartbeatAppliesSettingsAndCommandsInOrder(t *testing.T) {
 	if v.AutoStart || v.StartDelaySec != 5 || v.CompanyName != "Alpha Traders Pvt" {
 		t.Fatalf("settings not applied: %+v", v)
 	}
-	if v.Pending != string(autoscan.ScanNow) {
-		t.Fatalf("SCAN_NOW should be waiting for paper, got %q", v.Pending)
+	// The SCAN_NOW came after a pause: refused, and nothing waits.
+	if v.Pending != "" {
+		t.Fatalf("a SCAN_NOW to a paused PC must not wait for paper, got %q", v.Pending)
+	}
+	if r, _ := a.results.result("4"); r.Result != "FAILED" || r.Message != "This PC is paused." {
+		t.Fatalf("SCAN_NOW result %+v", r)
+	}
+	// The unknown kind is answered, and changes nothing.
+	if r, _ := a.results.result("5"); r.Result != "FAILED" || r.Message != "This version of Sally Desktop does not know that command." {
+		t.Fatalf("unknown kind result %+v", r)
+	}
+	for _, id := range []string{"1", "2", "3"} {
+		if r, _ := a.results.result(id); r.Result != "DONE" {
+			t.Fatalf("command %s result %+v", id, r)
+		}
 	}
 	if a.hbEvery != 15*time.Second {
 		t.Fatalf("heartbeat interval %s", a.hbEvery)
@@ -411,8 +428,8 @@ func TestHeartbeatReportsARefusedStack(t *testing.T) {
 	if err := a.store.MarkRefused(r.Stack, "it does not know this stack"); err != nil {
 		t.Fatal(err)
 	}
-	if e := a.report().Error; e != "Sally refused 1 stack, kept on this PC: it does not know this stack" {
-		t.Fatalf("heartbeat error %q", e)
+	if req, _ := a.report(); req.Error != "Sally refused 1 stack, kept on this PC: it does not know this stack" {
+		t.Fatalf("heartbeat error %q", req.Error)
 	}
 }
 
