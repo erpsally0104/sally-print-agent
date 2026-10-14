@@ -407,7 +407,7 @@ func TestHeartbeatReportsARefusedStack(t *testing.T) {
 	p := make([]byte, 100)
 	p[0], p[1] = 0xFF, 0xD8
 	w.Add(p)
-	r, _ := w.Finish("")
+	r, _ := w.Finish("", "")
 	if err := a.store.MarkRefused(r.Stack, "it does not know this stack"); err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestAfterARepairStacksForTheOldCompanyAreHeld(t *testing.T) {
 		p := make([]byte, 100)
 		p[0], p[1] = 0xFF, 0xD8
 		w.Add(p)
-		r, _ := w.Finish("")
+		r, _ := w.Finish("", "")
 		return r.Stack
 	}
 	scan()        // for co-1 / dev-1

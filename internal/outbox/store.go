@@ -41,6 +41,13 @@ const (
 	MaxSheets = 500
 )
 
+// How a pile ended early (Manifest.Ended).
+const (
+	EndedStopped = "STOPPED"
+	EndedJam     = "JAM"
+	EndedError   = "ERROR"
+)
+
 // KeepFor is how long a confirmed side stays when "keep a copy" is on.
 const KeepFor = 7 * 24 * time.Hour
 
@@ -91,6 +98,11 @@ type Manifest struct {
 	Complete bool `json:"complete"`
 	// Problem: why scanning stopped early (a jam), if it did.
 	Problem string `json:"problem,omitempty"`
+	// Ended says how a scanned stack whose pile ended early ended, for
+	// Sally: EndedStopped (someone pressed Stop), EndedJam (a paper jam) or
+	// EndedError (anything else, including a stack recovered after the
+	// agent stopped mid-scan). Empty for a pile that ran to its end.
+	Ended string `json:"ended,omitempty"`
 	RunID   string `json:"runId,omitempty"`
 	// Done: Sally acknowledged /done; nothing more to send.
 	Done bool `json:"done"`
@@ -214,6 +226,7 @@ func Open(dir string, sealer Sealer) (*Store, error) {
 			if m.Problem == "" {
 				m.Problem = "the agent stopped while this stack was scanning"
 			}
+			m.Ended = EndedError
 			m.Sheets = sheetsOf(m.Sides)
 			if err := s.writeManifest(&m); err != nil {
 				return nil, err
@@ -407,10 +420,36 @@ func plural(n int, one, many string) string {
 	return many
 }
 
+// DropLast removes the last side from the stack and deletes its file. It is
+// used only for a stopped duplex pile's unpaired front: a half-fed sheet is
+// never kept, so it is fed again whole.
+func (w *StackWriter) DropLast() error {
+	s := w.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.stacks[w.id]
+	if len(m.Sides) == 0 {
+		return nil
+	}
+	last := m.Sides[len(m.Sides)-1]
+	m.Sides = m.Sides[:len(m.Sides)-1]
+	m.Sheets = sheetsOf(m.Sides)
+	if err := s.writeManifest(m); err != nil {
+		m.Sides = append(m.Sides, last)
+		m.Sheets = sheetsOf(m.Sides)
+		return err
+	}
+	if err := os.Remove(filepath.Join(s.stackDir(w.id), last.File)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // Finish closes the stack. problem says why scanning stopped early (a jam)
-// or is empty. The receipt is Safe only if every Add succeeded and every
-// side's file is on disk.
-func (w *StackWriter) Finish(problem string) (Receipt, error) {
+// or is empty; ended is how a pile that ended early ended (EndedStopped,
+// EndedJam, EndedError) or "". The receipt is Safe only if every Add
+// succeeded and every side's file is on disk.
+func (w *StackWriter) Finish(problem, ended string) (Receipt, error) {
 	s := w.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -423,6 +462,7 @@ func (w *StackWriter) Finish(problem string) (Receipt, error) {
 	}
 	m.Complete = true
 	m.Problem = problem
+	m.Ended = ended
 	if err := s.writeManifest(m); err != nil {
 		return r, err
 	}

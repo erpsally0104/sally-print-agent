@@ -1054,7 +1054,7 @@ func (a *Agent) runJob(ctx context.Context, sc *Scanner, kind autoscan.Kind) boo
 // finish closes a stack and says "safe" only if every side is on disk.
 // quiet leaves the receipt to the caller (a stack the scanner cut short).
 func (a *Agent) finish(w *outbox.StackWriter, problem string, quiet bool) (outbox.Receipt, error) {
-	r, err := w.Finish(problem)
+	r, err := w.Finish(problem, "")
 	if err != nil {
 		a.logf("stack %s: %v", r.Stack, err)
 	}

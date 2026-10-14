@@ -125,13 +125,18 @@ type UploadTarget struct {
 }
 
 // AnnounceStack opens (or, for a stack already announced, reopens) the run
-// for a stack. received lists the sides Sally already holds.
-func (c *Client) AnnounceStack(ctx context.Context, stack string, sheets, sides int, scannedAt time.Time) (string, []SideRef, error) {
+// for a stack. received lists the sides Sally already holds. ended
+// (STOPPED, JAM or ERROR) is sent only for a pile that ended early; an
+// older Sally ignores it.
+func (c *Client) AnnounceStack(ctx context.Context, stack string, sheets, sides int, scannedAt time.Time, ended string) (string, []SideRef, error) {
 	var out struct {
 		RunID    string    `json:"runId"`
 		Received []SideRef `json:"received"`
 	}
 	in := map[string]any{"stack": stack, "sheets": sheets, "sides": sides, "scannedAt": scannedAt.UTC().Format(time.RFC3339)}
+	if ended != "" {
+		in["ended"] = ended
+	}
 	if _, err := c.do(ctx, http.MethodPost, "/api/agent/scan/stacks", in, &out); err != nil {
 		return "", nil, err
 	}

@@ -14,7 +14,7 @@ import (
 
 // API is the part of the Sally client the uploader uses.
 type API interface {
-	AnnounceStack(ctx context.Context, stack string, sheets, sides int, scannedAt time.Time) (string, []sally.SideRef, error)
+	AnnounceStack(ctx context.Context, stack string, sheets, sides int, scannedAt time.Time, ended string) (string, []sally.SideRef, error)
 	UploadURLs(ctx context.Context, runID string, sides []sally.SideDecl) ([]sally.UploadTarget, error)
 	PutObject(ctx context.Context, t sally.UploadTarget, body []byte) error
 	ConfirmSide(ctx context.Context, runID string, sheet, side int, sha256, ticket string) error
@@ -216,7 +216,7 @@ func (u *Uploader) sendStack(ctx context.Context, m *Manifest) error {
 	// Announcing is idempotent: for a stack Sally already knows, it answers
 	// with the same run and the sides it already holds, which is how a
 	// restarted agent resumes without sending anything twice.
-	runID, received, err := u.API.AnnounceStack(ctx, m.Stack, m.Sheets, len(m.Sides), m.Created)
+	runID, received, err := u.API.AnnounceStack(ctx, m.Stack, m.Sheets, len(m.Sides), m.Created, m.Ended)
 	if err != nil {
 		return err
 	}

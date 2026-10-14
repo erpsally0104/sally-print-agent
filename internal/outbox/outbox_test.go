@@ -75,7 +75,7 @@ func TestSafeOnlyWhenEverySideIsOnDisk(t *testing.T) {
 	if len(s.Stacks()) != 0 {
 		t.Fatal("an unfinished stack must not be offered for upload")
 	}
-	r, err := w.Finish("")
+	r, err := w.Finish("", "")
 	if err != nil || !r.Safe {
 		t.Fatalf("finish: %+v %v", r, err)
 	}
@@ -119,7 +119,7 @@ func TestNotSafeWhenASideFailedToWrite(t *testing.T) {
 	if err := w.Add(page(2)); err == nil {
 		t.Fatal("the third write should fail")
 	}
-	r, err := w.Finish("")
+	r, err := w.Finish("", "")
 	if err == nil || r.Safe || r.Message() != "" {
 		t.Fatalf("must not say safe after a failed write: %+v %v", r, err)
 	}
@@ -134,7 +134,7 @@ func TestNotSafeWhenAFileVanished(t *testing.T) {
 	w, _ := s.NewStack(true)
 	w.Add(page(0))
 	os.Remove(filepath.Join(s.Dir(), w.ID(), "sheet-001-side-1.page"))
-	if r, err := w.Finish(""); err == nil || r.Safe {
+	if r, err := w.Finish("", ""); err == nil || r.Safe {
 		t.Fatal("a missing file must not be called safe")
 	}
 }
@@ -147,7 +147,7 @@ func TestRejectsNonJPEGAndEmptyStacksVanish(t *testing.T) {
 	}
 	s2 := openStore(t, t.TempDir())
 	w2, _ := s2.NewStack(true)
-	r, err := w2.Finish("")
+	r, err := w2.Finish("", "")
 	if err != nil || r.Sides != 0 || r.Message() != "" {
 		t.Fatalf("%+v %v", r, err)
 	}
@@ -201,6 +201,9 @@ type fakeSally struct {
 	maxPar   int32
 	failPuts int32 // fail this many PUTs with 500
 	announce int
+	// ended is what each announce of a stack said in "ended" (absent
+	// when the key was not sent).
+	ended map[string]any
 	// refuse answers announcing these stacks with this status.
 	refuse map[string]int
 	// badHash answers every side of these runs 422.
@@ -254,6 +257,12 @@ func (f *fakeSally) serve(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/agent/scan/stacks":
 		f.announce++
 		stack := in["stack"].(string)
+		if v, ok := in["ended"]; ok {
+			if f.ended == nil {
+				f.ended = map[string]any{}
+			}
+			f.ended[stack] = v
+		}
 		if code := f.refuse[stack]; code != 0 {
 			w.WriteHeader(code)
 			json.NewEncoder(w).Encode(map[string]any{"error": "That stack is not yours."})
@@ -340,7 +349,7 @@ func scanStack(t *testing.T, s *Store, sides int) Receipt {
 			t.Fatal(err)
 		}
 	}
-	r, err := w.Finish("")
+	r, err := w.Finish("", "")
 	if err != nil || !r.Safe {
 		t.Fatal(err)
 	}
@@ -645,7 +654,7 @@ func TestOneSidedScanNumbersEverySideAsItsOwnSheet(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	r, err := w.Finish("")
+	r, err := w.Finish("", "")
 	if err != nil || r.Sheets != 3 || r.Sides != 3 || r.Message() != "Got 3 sheets. Safe on this PC." {
 		t.Fatalf("%+v %v", r, err)
 	}
@@ -689,5 +698,73 @@ func TestTodayCountsOnlyTodaysStacks(t *testing.T) {
 	c := s.Counts()
 	if c.TodayStacks != 2 || c.TodaySheets != 4 || c.SidesWaiting != 11 {
 		t.Fatalf("%+v", c)
+	}
+}
+
+func TestEndedSurvivesARestartAndIsAnnounced(t *testing.T) {
+	f := newFakeSally(t)
+	dir := t.TempDir()
+	s := openStore(t, dir)
+	w, _ := s.NewStack(true)
+	for i := 0; i < 4; i++ {
+		w.Add(page(i))
+	}
+	stopped, err := w.Finish("", EndedStopped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := scanStack(t, s, 2)
+
+	s2 := openStore(t, dir)
+	for _, m := range s2.Stacks() {
+		if m.Stack == stopped.Stack && m.Ended != EndedStopped {
+			t.Fatalf("ended lost on restart: %+v", m)
+		}
+	}
+	u := &Uploader{Store: s2, API: f.client()}
+	if err := u.SendAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ended[stopped.Stack] != EndedStopped {
+		t.Fatalf("announced ended %v", f.ended)
+	}
+	if _, ok := f.ended[plain.Stack]; ok {
+		t.Fatal("a pile that ran to its end must not send ended")
+	}
+}
+
+func TestDropLastRemovesTheSideAndItsFile(t *testing.T) {
+	dir := t.TempDir()
+	s := openStore(t, dir)
+	w, _ := s.NewStack(true)
+	for i := 0; i < 3; i++ {
+		w.Add(page(i))
+	}
+	if err := w.DropLast(); err != nil {
+		t.Fatal(err)
+	}
+	if w.Sides() != 2 {
+		t.Fatalf("%d sides", w.Sides())
+	}
+	if _, err := os.Stat(filepath.Join(dir, w.ID(), "sheet-002-side-1.page")); !os.IsNotExist(err) {
+		t.Fatalf("the dropped front's file is still there: %v", err)
+	}
+	r, err := w.Finish("", EndedStopped)
+	if err != nil || !r.Safe || r.Sheets != 1 || r.Sides != 2 {
+		t.Fatalf("%+v %v", r, err)
+	}
+}
+
+func TestAStackRecoveredAtOpenEndedInError(t *testing.T) {
+	dir := t.TempDir()
+	s := openStore(t, dir)
+	w, _ := s.NewStack(true)
+	w.Add(page(0))
+	s2 := openStore(t, dir)
+	st := s2.Stacks()
+	if len(st) != 1 || st[0].Ended != EndedError {
+		t.Fatalf("%+v", st)
 	}
 }
