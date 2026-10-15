@@ -155,11 +155,13 @@ arguments, and only a printer name the OS itself reported can reach one.
 
 ## Scanning
 
-> **0.3.0 has not yet run on a real scanner.** The scanner list, the
-> scanner choice, Stop this pile and the command results are tested against
-> fakes only. Before v0.3.0 is tagged, the owner tests it on an HP ScanJet
-> Pro N4000 over USB and over the network (erp-sally
-> `docs/signed-copies/d1-d3-scanner-control.md`, Rollout step 4).
+> **0.3.1 has not yet run on a real scanner.** Its USB list (present
+> interfaces only, from the configuration manager) and what it says when a
+> USB scanner cannot be used are tested against fakes only, like 0.3.0's
+> scanner list, choice, Stop this pile and command results. Before v0.3.1 is
+> tagged, the owner tests it on an HP ScanJet Pro N4000 over USB and over the
+> network (erp-sally `docs/signed-copies/d1-d3-scanner-control.md`, Rollout
+> step 4).
 
 Sally Desktop watches one scanner, scans whatever is put in its feeder, keeps
 every page safe on the PC, and sends the pages to Sally as one run per stack
@@ -181,17 +183,28 @@ code is in `internal/`:
 | `internal/desktop` | ties them together; the status page's Scanner card reads it |
 
 **The scanner on USB (Windows).** Scanners such as the HP ScanJet Pro N4000
-expose IPP-over-USB (class 7/1/4, driver `usbprint`) and nothing in WIA. The
-agent asks SetupAPI for the device interface
-`{f2f40381-f46d-4e51-bce7-62de6cf2d098}` and, because that found nothing on the
-real machine, also reads the subkeys of
-`HKLM\SYSTEM\CurrentControlSet\Control\DeviceClasses\{f2f40381-…}` (a subkey
-`##?#USB#…` is the path `\\?\USB#…`; ones whose `#\Control` has `Linked = 1`
-come first). It opens the path with overlapped I/O and speaks plain HTTP/1.1
-over it with `Host: localhost:60000`. Every request goes out in one complete,
+expose IPP-over-USB interfaces (class 7/1/4, driver `usbprint`; the N4000 has
+`PI_00` and `PI_01`). The agent asks the configuration manager (`cfgmgr32.dll`,
+loaded from System32) for the device interfaces
+`{f2f40381-f46d-4e51-bce7-62de6cf2d098}` present now, and keeps those whose
+compatible ids include `USB\Class_07&SubClass_01&Prot_04` (or, when Windows
+gives none, whose path has a `PI_` field): the registry's entries for that
+class also hold devices long unplugged, such as an old 7/1/2 printer, and
+0.3.0 listed those. Each is named as its USB device reports itself. It opens
+the path with overlapped I/O and speaks plain HTTP/1.1 over it with
+`Host: localhost:60000`. Every request goes out in one complete,
 unbuffered write; stale bytes are drained before each request; every read has
 a timeout (CancelIoEx on expiry). All of it through `package syscall`: no cgo,
 no `golang.org/x/sys`.
+
+When no interface of a USB scanner answers, the agent says why if it knows:
+"not found on USB" when its interfaces are gone, or "USB connection blocked
+by Windows" when a read or open is refused at once ("Access is denied") or
+the device is still plugged in while its IPP-over-USB interfaces are gone.
+Why Windows holds the channel is not proven: another scan app may be using
+it, or Windows may have switched the scanner to its maker's mode. The status
+page and the problem Sally gets say so in plain words, and the scanner's
+network path, if it has one, is still tried.
 
 **Network scanners** are found with an mDNS query for `_uscan._tcp.local` and
 `_uscans._tcp.local` (TXT `rs` gives the eSCL path), or by an IP or
@@ -215,9 +228,11 @@ rejects, and the bytes go to Sally exactly as the scanner made them.
 on Windows, the typed address, and up to 32 mDNS adverts per pass, those
 seen before first) and refreshes the list every minute and on *Look again*,
 never while a pile scans; the open scanner is never probed by the list. A
-USB device is probed again only when it is new, relinked or failed more
-than 5 minutes ago, an answering network scanner every 5 minutes, and an
-entry unseen for 3 passes leaves the list unless it is the chosen one.
+USB device is probed again when it is new or back on the list, or its last
+probe (answering or not) is more than 5 minutes old, so USB answers expire
+after 5 minutes too; an answering network scanner every 5 minutes. An entry
+unseen for 3 passes leaves the list unless it is the chosen one, which stays,
+says why (for a USB-only one, not found on USB) and is waited for.
 Each scanner has an id, `sc-` + the first 20 hex characters of SHA-256
 over the first key that exists: the top-level `scan:UUID` of its
 capabilities, else its make and model plus top-level `pwg:SerialNumber`,
@@ -620,12 +635,14 @@ OIDC role once an OIDC provider exists in the account.)
 
 The installers build and the release publishes them. What is left:
 
-- **Scanning on real hardware.** The USB path (SetupAPI, the DeviceClasses
-  registry, overlapped I/O, DPAPI, PlaySoundW) cross-compiles and vets, but has
-  not run against the HP N4000 in this form. Check first: that the registry
-  path is found and opened, that a status poll answers within a second, that
-  the drain does not eat the start of a reply, and that a 50-sheet duplex
-  stack arrives as 100 sides in order.
+- **Scanning on real hardware.** The USB path (the configuration manager
+  list, overlapped I/O, DPAPI, PlaySoundW) cross-compiles and vets, and the
+  configuration manager calls were checked read-only on the owner's laptop,
+  but 0.3.1 has not scanned on the HP N4000. Check first: that the N4000 is
+  listed once by its own name and an unplugged printer not at all, that a
+  status poll answers within a second, that the drain does not eat the start
+  of a reply, that a 50-sheet duplex stack arrives as 100 sides in order, and
+  what the page says when Windows refuses the channel.
 
 - **Certificates.** The signing steps are written and gated on secrets, so
   every release still builds without them — and ships **unsigned**. Windows
