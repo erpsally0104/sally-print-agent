@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -173,6 +174,28 @@ func reasonOf(err error) string {
 	return ""
 }
 
+// anotherError is OpenFound's error when a USB device answered as another
+// scanner: whatever its other interfaces said, it answers, so the error
+// carries no reason. Devices names their device keys.
+type anotherError struct {
+	Devices []string
+	Err     error
+}
+
+func (e *anotherError) Error() string { return fmt.Sprint(e.Err) }
+
+func (e *anotherError) Unwrap() error { return e.Err }
+
+// anotherOf is the device keys of the USB devices that answered as another
+// scanner in an OpenFound error, or nil.
+func anotherOf(err error) []string {
+	var o *anotherError
+	if errors.As(err, &o) {
+		return o.Devices
+	}
+	return nil
+}
+
 // Via lists how the scanner can be reached: USB first, each once.
 func (f Found) Via() []string {
 	var v []string
@@ -259,6 +282,16 @@ func (c *ProbeCache) replace(key string, p probe) {
 	if _, ok := c.m[key]; ok {
 		c.m[key] = p
 	}
+}
+
+// forget drops the probe of key, answering or not.
+func (c *ProbeCache) forget(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, key)
 }
 
 // forgetAnswer drops the probe of key if it answered, so the next pass
@@ -649,10 +682,12 @@ func autoOrder(found []Found) []Found {
 
 // OpenFound opens one scanner from the list: its USB paths first, then its
 // network addresses. A device whose id is not f.ID is refused. When nothing
-// opened and the USB tries say why, the error is a *usbError.
+// opened and a USB device answered as another scanner, the error is an
+// *anotherError; otherwise, when the USB tries say why, a *usbError.
 func OpenFound(ctx context.Context, f Found, logf func(string, ...any)) (*Scanner, error) {
 	var last error = errors.New("the scanner has no address")
 	var usbErrs []error
+	var other []string
 	for _, p := range f.USB {
 		port, err := openUSB(p)
 		if err != nil {
@@ -677,6 +712,9 @@ func OpenFound(ctx context.Context, f Found, logf func(string, ...any)) (*Scanne
 			port.Close()
 			last = fmt.Errorf("the scanner at %s is another scanner now", p)
 			usbErrs = append(usbErrs, last)
+			if k := usbscan.DeviceKey(p); !slices.Contains(other, k) {
+				other = append(other, k)
+			}
 			continue
 		}
 		fallback := "USB scanner"
@@ -709,6 +747,9 @@ func OpenFound(ctx context.Context, f Found, logf func(string, ...any)) (*Scanne
 			s.learned = map[string]string{b.keys.key: id}
 		}
 		return s, nil
+	}
+	if len(other) > 0 {
+		return nil, &anotherError{Devices: other, Err: last}
 	}
 	if r := attachedReason(usbReason(usbErrs), f.USB); r != "" {
 		return nil, &usbError{Reason: r, Err: last}

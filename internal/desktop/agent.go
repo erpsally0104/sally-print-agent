@@ -1432,6 +1432,12 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) (sc *Scanner, cha
 		}
 		changed = signature(a.inventory) != before
 		a.mu.Unlock()
+	} else {
+		// A device that answered as another scanner is probed again by the
+		// next pass, which lists it under its id at once.
+		for _, k := range anotherOf(err) {
+			a.probes.forget(usbKeys(k).key)
+		}
 	}
 	a.lookMu.Unlock()
 	if err != nil {

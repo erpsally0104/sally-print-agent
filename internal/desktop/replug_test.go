@@ -46,3 +46,35 @@ func TestAScannerReplugAfterARefusedOpenIsProbedAtOnce(t *testing.T) {
 		t.Fatalf("back: %+v %v", f, ok)
 	}
 }
+
+// After a replug the chosen last-resort id's device answers under its UUID
+// on one interface while Windows refuses the other: it answers, so the
+// stale entry is not held by Windows and the UUID entry is listed at once.
+func TestADeviceThatAnswersAsAnotherScannerIsNotHeldByWindows(t *testing.T) {
+	u := installUSB(t, n4000(refusesRead, refusesRead))
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	a.opt.Look = Look
+	ctx := context.Background()
+	a.inventoryPass(ctx)
+	stale := ScannerID(usbKeys(usbscan.DeviceKey(n4000PI0)).key)
+	if f, ok := a.foundLocked(stale); !ok || f.Reason != ReasonWindows {
+		t.Fatalf("%+v %v", f, ok)
+	}
+	a.local.ScannerID = stale
+
+	u.set(func(u *fakeUSB) { u.do = map[string]string{n4000PI0: refusesRead, n4000PI1: answers} })
+	f, _ := a.foundLocked(stale)
+	if sc, err := OpenFound(ctx, f, quiet); sc != nil || reasonOf(err) != "" {
+		t.Errorf("OpenFound: %v %v", sc, err)
+	}
+	if sc, _ := a.openChosen(ctx, stale); sc != nil {
+		t.Fatal("opened another scanner")
+	}
+	a.inventoryPass(ctx)
+	if f, ok := a.foundLocked(stale); !ok || f.Answering || f.Reason != "" {
+		t.Fatalf("the stale entry: %+v %v", f, ok)
+	}
+	if f, ok := a.foundLocked(ScannerID("uuid:" + usbUUID)); !ok || !f.Answering {
+		t.Fatalf("the UUID entry: %+v %v", f, ok)
+	}
+}
