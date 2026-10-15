@@ -247,6 +247,20 @@ func (c *ProbeCache) put(key string, p probe) {
 	c.m[key] = p
 }
 
+// replace stores p for key only when the cache holds a probe of key: a
+// device the last pass did not list keeps none, so it is probed at once
+// when it comes back.
+func (c *ProbeCache) replace(key string, p probe) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.m[key]; ok {
+		c.m[key] = p
+	}
+}
+
 // forgetAnswer drops the probe of key if it answered, so the next pass
 // probes it again.
 func (c *ProbeCache) forgetAnswer(key string) {
