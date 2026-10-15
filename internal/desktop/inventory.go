@@ -25,8 +25,9 @@ since the device's probe may be older than the open, and a miss. An unseen
 entry whose USB device the pass listed (it may answer under another id
 now) has the reason that device's last probe gave. An unseen USB-only entry whose
 device is not listed is not found on USB, or held by Windows when its USB
-device is still plugged in; one also reached over the network keeps its
-reason, which openChosen sets by the same rules.
+device is still plugged in. One also reached over the network has no
+reason, unless it is the chosen one: that keeps its reason, which
+openChosen sets by the same rules after every pass.
 */
 
 // maxScanners is the most the heartbeat lists.
@@ -90,13 +91,16 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	// Why the USB entries this pass did not see cannot be used, worked out
 	// outside a.mu: only a device that is not listed is not found, or held
 	// by Windows when it is still plugged in. A listed device says what its
-	// last probe said, as openChosen does.
+	// last probe said, as openChosen does. An entry also reached over the
+	// network has no reason, except the chosen one, which keeps the reason
+	// openChosen gives it.
 	seen := map[string]bool{}
 	for _, f := range found {
 		seen[f.ID] = true
 	}
 	var unseen []Found
 	a.mu.Lock()
+	chosen := a.local.ScannerID
 	for _, f := range a.inventory {
 		if !seen[f.ID] && len(f.USB) > 0 && !skip.leaves(f) && (a.inUse == nil || a.inUse.ID != f.ID) {
 			unseen = append(unseen, f)
@@ -128,8 +132,12 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 				break
 			}
 		}
-		if !listed && len(f.Net) == 0 {
+		switch {
+		case listed:
+		case len(f.Net) == 0:
 			reasons[f.ID] = attachedReason(ReasonNotFound, f.USB)
+		case f.ID != chosen:
+			reasons[f.ID] = ""
 		}
 	}
 
@@ -171,7 +179,8 @@ func (a *Agent) mergeInventoryLocked(found []Found, now time.Time) bool {
 // mergeSeenLocked is mergeInventoryLocked for a Look that left skip alone:
 // the open scanner's entry it names is not judged. reasons says why unseen USB
 // entries cannot be used; without one a USB-only entry is not found, and
-// one also reached over the network keeps its reason.
+// one also reached over the network (the chosen one, in a pass) keeps its
+// reason.
 func (a *Agent) mergeSeenLocked(found []Found, now time.Time, reasons map[string]string, skip Skip) bool {
 	before := signature(a.inventory)
 	prev := map[string]Found{}

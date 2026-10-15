@@ -121,3 +121,31 @@ func TestTheOpenScannersStaleTwinIsJudgedAndDropped(t *testing.T) {
 		}
 	}
 }
+
+// A scanner reached by USB and the network, not chosen, that Windows held
+// is unplugged: in Automatic the pass does not keep it held by Windows,
+// and Sally is not told so.
+func TestAnUnpluggedScannerAlsoOnTheNetworkThatIsNotChosenIsNotKeptHeldByWindows(t *testing.T) {
+	installUSB(t, &fakeUSB{})
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	id := ScannerID("uuid:" + usbUUID)
+	a.mergeInventoryLocked([]Found{{ID: id, Name: n4000Name, USB: []string{n4000PI0, n4000PI1},
+		Net: []netBase{{URL: "http://127.0.0.1:1", Root: "eSCL", keys: addrKeys("127.0.0.1:1")}}, Reason: ReasonWindows}}, time.Now())
+	a.local.ScannerID = "" // Automatic
+	a.local.KnownScanners = map[string]string{usbKeys(usbscan.DeviceKey(n4000PI0)).key: id}
+	if r, _ := a.linkLocked(); r != ReasonWindows {
+		t.Fatalf("before: %q", r)
+	}
+	var list []Found // unplugged, and the network address does not answer
+	a.opt.Look = lookReturning(&list)
+	a.inventoryPass(context.Background())
+	if f, ok := a.foundLocked(id); !ok || f.Answering || f.Reason != "" {
+		t.Fatalf("%+v %v", f, ok)
+	}
+	if r, _ := a.linkLocked(); r != "" {
+		t.Fatalf("linkLocked: %q", r)
+	}
+	if req, _ := a.report(); req.Scanner.Problem == linkProblem[ReasonWindows] {
+		t.Fatalf("%q", req.Scanner.Problem)
+	}
+}
