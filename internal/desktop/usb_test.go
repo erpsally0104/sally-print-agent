@@ -34,6 +34,7 @@ const (
 	refusesOpen = "refuses-open"
 	refusesRead = "refuses-read"
 	isGone      = "gone"
+	failsRead   = "fails-read"
 )
 
 // fakeUSB stands in for Windows: the interfaces it lists, what each does,
@@ -66,6 +67,8 @@ func installUSB(t *testing.T, u *fakeUSB) *fakeUSB {
 			return &capsPort{uuid: u.uuid}, nil
 		case refusesRead:
 			return &refusedPort{}, nil
+		case failsRead:
+			return failedPort{}, nil
 		case refusesOpen:
 			return nil, fmt.Errorf("usbscan: opening the scanner: %w", fs.ErrPermission)
 		}
@@ -335,3 +338,13 @@ func TestUSBReasons(t *testing.T) {
 		}
 	}
 }
+
+// failedPort opens, but its first read fails at once for a reason that
+// says nothing about why.
+type failedPort struct{}
+
+func (failedPort) Write(b []byte) (int, error) { return len(b), nil }
+func (failedPort) ReadTimeout([]byte, time.Duration) (int, error) {
+	return 0, errors.New("usbscan: read: the device did not respond")
+}
+func (failedPort) Close() error { return nil }

@@ -131,8 +131,8 @@ func TestOpenChosenMarksTheEntryWhenUSBCannotBeUsed(t *testing.T) {
 	if g, _ := a.foundLocked(id); g.Answering || g.Reason != ReasonWindows {
 		t.Fatalf("%+v", g)
 	}
-	if _, ok := a.probes.get(usbKey); ok {
-		t.Fatal("the cached answer must go")
+	if c, ok := a.probes.get(usbKey); !ok || c.answering || c.caps != nil || c.reason != ReasonWindows {
+		t.Fatalf("the try must replace the cached answer: %+v %v", c, ok)
 	}
 	if _, ok := a.probes.get(netKey); !ok {
 		t.Fatal("a cached failure stays")

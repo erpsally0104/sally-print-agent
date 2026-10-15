@@ -192,3 +192,46 @@ func TestAPassDoesNotUndoTheMarkOfAnOpenThatWaitedForIt(t *testing.T) {
 		t.Fatalf("%+v", g)
 	}
 }
+
+// A pass whose reads failed for no known reason, then Windows refuses the
+// chosen scanner: the next pass reuses the refused try, not the older
+// probe, so the reason stays and Sally is not told twice.
+func TestAPassKeepsTheReasonOfTheChosenScannersRefusedOpen(t *testing.T) {
+	u := installUSB(t, n4000(failsRead, failsRead))
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	a.opt.Look = Look
+	ctx := context.Background()
+	a.inventoryPass(ctx)
+	id := ScannerID(usbKeys(usbscan.DeviceKey(n4000PI0)).key)
+	if f, ok := a.foundLocked(id); !ok || f.Answering || f.Reason != "" {
+		t.Fatalf("%+v %v", f, ok)
+	}
+	a.local.ScannerID = id
+	u.set(func(u *fakeUSB) { u.do = map[string]string{n4000PI0: refusesRead, n4000PI1: refusesRead} })
+	if sc := a.openChosen(ctx, id); sc != nil {
+		t.Fatal("opened")
+	}
+	if f, _ := a.foundLocked(id); f.Reason != ReasonWindows {
+		t.Fatalf("%+v", f)
+	}
+	select {
+	case <-a.hbKick:
+	default:
+	}
+	opened := len(u.openedNow())
+	a.inventoryPass(ctx)
+	if f, _ := a.foundLocked(id); f.Answering || f.Reason != ReasonWindows {
+		t.Fatalf("after the pass: %+v", f)
+	}
+	if req, _ := a.report(); req.Scanner.Problem != linkProblem[ReasonWindows] {
+		t.Fatalf("%q", req.Scanner.Problem)
+	}
+	select {
+	case <-a.hbKick:
+		t.Fatal("a heartbeat was kicked")
+	default:
+	}
+	if n := len(u.openedNow()); n != opened {
+		t.Fatalf("the pass opened the device again: %v", u.openedNow()[opened:])
+	}
+}

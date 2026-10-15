@@ -1405,8 +1405,9 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
 		a.openSkip = skipOf(sc)
 		a.mu.Unlock()
 	} else if r := reasonOf(err); r != "" {
-		// The list says why at once, and the next pass probes it again
-		// instead of trusting an answer from before.
+		// The list says why at once. This try is the USB device's probe,
+		// which the next pass reuses instead of trusting one from before;
+		// a network answer is probed again.
 		a.mu.Lock()
 		before := signature(a.inventory)
 		for i := range a.inventory {
@@ -1414,8 +1415,9 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
 				a.inventory[i].Answering, a.inventory[i].Reason = false, r
 			}
 		}
+		at := time.Now() // Look's clock
 		for _, p := range f.USB {
-			a.probes.forgetAnswer(usbKeys(usbscan.DeviceKey(p)).key)
+			a.probes.put(usbKeys(usbscan.DeviceKey(p)).key, probe{reason: r, at: at})
 		}
 		for _, b := range f.Net {
 			a.probes.forgetAnswer(b.keys.key)
