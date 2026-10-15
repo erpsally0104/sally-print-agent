@@ -15,7 +15,9 @@ The scanner list. inventoryLoop looks for every scanner the PC can reach
 choice), never while a pile scans. Sightings with the same id are one entry
 (identity.go). An entry unseen for 3 passes is dropped, unless it is the
 chosen one; the open scanner is never probed by the list, and is listed as
-answering while the agent talks to it.
+answering while the agent talks to it. An unseen USB-only entry is listed
+as not found on USB, or as held by Windows when its USB device is still
+plugged in.
 */
 
 // maxScanners is the most the heartbeat lists.
@@ -74,8 +76,29 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 		return
 	}
 
+	// The attached rule for the USB-only entries this pass did not see,
+	// worked out outside a.mu.
+	seen := map[string]bool{}
+	for _, f := range found {
+		seen[f.ID] = true
+	}
+	var unseen []Found
 	a.mu.Lock()
-	changed := a.mergeInventoryLocked(found, a.opt.Now())
+	for _, f := range a.inventory {
+		if !seen[f.ID] && len(f.USB) > 0 && len(f.Net) == 0 && (a.inUse == nil || a.inUse.ID != f.ID) {
+			unseen = append(unseen, f)
+		}
+	}
+	a.mu.Unlock()
+	attached := map[string]bool{}
+	for _, f := range unseen {
+		if attachedReason(ReasonNotFound, f.USB) == ReasonWindows {
+			attached[f.ID] = true
+		}
+	}
+
+	a.mu.Lock()
+	changed := a.mergeSeenLocked(found, a.opt.Now(), attached)
 	a.mu.Unlock()
 	if changed {
 		a.kickHeartbeat()
@@ -86,8 +109,8 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	}
 }
 
-// signature is what a change to the list is judged by: ids, names and
-// answering flags.
+// signature is what a change to the list is judged by: ids, names,
+// answering flags and reasons.
 func signature(fs []Found) string {
 	var b strings.Builder
 	for _, f := range fs {
@@ -95,7 +118,7 @@ func signature(fs []Found) string {
 		if f.Answering {
 			b.WriteString("1")
 		}
-		b.WriteString("\x00")
+		b.WriteString("\x00" + f.Reason + "\x00")
 	}
 	return b.String()
 }
@@ -105,6 +128,13 @@ func signature(fs []Found) string {
 // answering, and the open scanner is kept answering. It remembers the ids
 // the capabilities gave, and reports whether the list changed.
 func (a *Agent) mergeInventoryLocked(found []Found, now time.Time) bool {
+	return a.mergeSeenLocked(found, now, nil)
+}
+
+// mergeSeenLocked is mergeInventoryLocked; attached names the unseen
+// USB-only entries whose USB device is still plugged in, which are held by
+// Windows rather than not found.
+func (a *Agent) mergeSeenLocked(found []Found, now time.Time, attached map[string]bool) bool {
 	before := signature(a.inventory)
 	prev := map[string]Found{}
 	for _, f := range a.inventory {
@@ -137,6 +167,13 @@ func (a *Agent) mergeInventoryLocked(found []Found, now time.Time) bool {
 		if p.ID != inUse {
 			p.Misses++
 			p.Answering = false
+			p.Reason = ""
+			if len(p.USB) > 0 && len(p.Net) == 0 {
+				p.Reason = ReasonNotFound
+				if attached[p.ID] {
+					p.Reason = ReasonWindows
+				}
+			}
 		}
 		if p.Misses < dropAfterMisses || p.ID == a.local.ScannerID || p.ID == inUse {
 			out = append(out, p)
@@ -164,6 +201,9 @@ func (a *Agent) mergeInUseLocked(now time.Time) {
 		f.USB = unionStrings(u.USB, f.USB)
 		f.Net = unionBases(f.Net, u.Net)
 		f.Answering = f.Answering || answering
+		if f.Answering {
+			f.Reason = ""
+		}
 		if f.Feeder == nil {
 			f.Feeder = u.Feeder
 		}
@@ -171,6 +211,9 @@ func (a *Agent) mergeInUseLocked(now time.Time) {
 		return
 	}
 	u.Answering = answering
+	if answering {
+		u.Reason = ""
+	}
 	if u.FirstSeen.IsZero() {
 		u.FirstSeen = now
 	}
@@ -260,7 +303,8 @@ func (a *Agent) foundLocked(id string) (Found, bool) {
 // in use; the chosen one; scanners seen in an earlier pass (first seen
 // first) before new ones; USB before network; answering before not; then
 // by name. The chosen scanner is always there, not answering when it was
-// never seen.
+// never seen (and not found, once a pass has run, when it was reached by
+// USB only).
 func (a *Agent) orderedLocked() []Found {
 	list := append([]Found(nil), a.inventory...)
 	chosen := a.local.ScannerID
@@ -279,6 +323,9 @@ func (a *Agent) orderedLocked() []Found {
 			}
 			if len(f.USB) == 0 && len(f.Net) == 0 {
 				f.Net = []netBase{{}}
+			}
+			if len(f.Net) == 0 && !a.invPass.IsZero() {
+				f.Reason = ReasonNotFound
 			}
 			list = append(list, f)
 		}

@@ -1363,7 +1363,7 @@ func (a *Agent) openedLocked(sc *Scanner) {
 		f.Net = unionBases([]netBase{{URL: sc.Where, Root: sc.Client.Root}}, f.Net)
 	}
 	a.openSkip = skipOf(sc)
-	f.Answering = true
+	f.Answering, f.Reason = true, ""
 	a.inUse = &f
 	a.learnLocked(sc.learned, a.opt.Now())
 	a.mergeInUseLocked(a.opt.Now())

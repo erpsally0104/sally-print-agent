@@ -70,6 +70,9 @@ type Found struct {
 	USB       []string
 	Net       []netBase
 	Answering bool
+	// Reason says why a scanner that is not answering cannot be used, when
+	// that is known: ReasonNotFound or ReasonWindows.
+	Reason string
 	// FirstSeen, LastSeen and Misses are kept by the agent's inventory.
 	FirstSeen time.Time
 	LastSeen  time.Time
@@ -85,6 +88,89 @@ type Found struct {
 	namedByCaps bool
 	// learned is the sighting key → id to remember.
 	learned map[string]string
+}
+
+// Why a USB scanner is not answering.
+const (
+	// ReasonNotFound: its USB interfaces are not there.
+	ReasonNotFound = "NOT_FOUND"
+	// ReasonWindows: Windows would not let the agent use the channel.
+	ReasonWindows = "WINDOWS"
+)
+
+// usbReason says why no USB interface answered, from the errors of the
+// tries: Windows if any was refused, NotFound if all were gone, else "".
+func usbReason(errs []error) string {
+	for _, e := range errs {
+		if usbscan.Refused(e) {
+			return ReasonWindows
+		}
+	}
+	if len(errs) == 0 {
+		return ""
+	}
+	for _, e := range errs {
+		if !usbscan.Gone(e) {
+			return ""
+		}
+	}
+	return ReasonNotFound
+}
+
+// attachedReason is the attached rule: NotFound becomes Windows when the
+// USB device of one of the paths is still plugged in (Windows switched it
+// to its maker's mode, or holds it). It makes system calls: never call it
+// under a.mu.
+func attachedReason(reason string, paths []string) string {
+	if reason != ReasonNotFound {
+		return reason
+	}
+	for _, p := range paths {
+		if p != "" && attachedUSB(p) {
+			return ReasonWindows
+		}
+	}
+	return reason
+}
+
+// reasonRank orders reasons: Windows says more than NotFound.
+func reasonRank(r string) int {
+	switch r {
+	case ReasonWindows:
+		return 2
+	case ReasonNotFound:
+		return 1
+	}
+	return 0
+}
+
+// usbError is OpenFound's error when nothing opened and the USB tries say
+// why.
+type usbError struct {
+	Reason string
+	Err    error
+}
+
+func (e *usbError) Error() string {
+	what := map[string]string{
+		ReasonNotFound: "not found on USB",
+		ReasonWindows:  "USB connection refused by Windows",
+	}[e.Reason]
+	if what == "" {
+		what = e.Reason
+	}
+	return what + ": " + fmt.Sprint(e.Err)
+}
+
+func (e *usbError) Unwrap() error { return e.Err }
+
+// reasonOf is the reason an OpenFound error carries, or "".
+func reasonOf(err error) string {
+	var u *usbError
+	if errors.As(err, &u) {
+		return u.Reason
+	}
+	return ""
 }
 
 // Via lists how the scanner can be reached: USB first, each once.
@@ -121,8 +207,9 @@ type Skip struct {
 
 // ProbeCache remembers the last probe of each sighting, so the inventory
 // does not open a USB scanner every minute: a USB device is probed again
-// only when it is new, relinked, or failed more than 5 minutes ago, and an
-// answering network scanner every 5 minutes.
+// when it is new or back on the list, or its last probe (answering or not)
+// is more than 5 minutes old, and an answering network scanner every 5
+// minutes.
 type ProbeCache struct {
 	mu sync.Mutex
 	m  map[string]probe
@@ -131,8 +218,9 @@ type ProbeCache struct {
 type probe struct {
 	caps      *escl.Capabilities
 	answering bool
-	linked    bool
-	at        time.Time
+	// reason says why a USB device did not answer (Reason…).
+	reason string
+	at     time.Time
 }
 
 const reprobeAfter = 5 * time.Minute
@@ -159,6 +247,21 @@ func (c *ProbeCache) put(key string, p probe) {
 	c.m[key] = p
 }
 
+// forgetUSB drops the probes of USB devices that are not in present (cache
+// keys), so a device that comes back is probed at once.
+func (c *ProbeCache) forgetUSB(present map[string]bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.m {
+		if strings.HasPrefix(k, "usb:") && !present[k] {
+			delete(c.m, k)
+		}
+	}
+}
+
 // sighting is one scanner seen one way, before merging.
 type sighting struct {
 	keys      sightingKeys
@@ -172,7 +275,17 @@ type sighting struct {
 	typed     bool
 	mdns      bool
 	devKey    string
+	// reason says why a USB device did not answer.
+	reason string
 }
+
+// The system calls Look and OpenFound make; tests replace them.
+var (
+	findUSB     = usbscan.FindAll
+	openUSB     = usbscan.Open
+	attachedUSB = usbscan.Attached
+	browseMDNS  = mdns.Browse
+)
 
 // Look lists every scanner the PC can find: USB (Windows), the typed
 // address, and mDNS (at most 32 instances, those seen before first). Each
@@ -182,51 +295,7 @@ func Look(ctx context.Context, address string, skip Skip, known map[string]strin
 	now := time.Now()
 	var sights []sighting
 
-	// USB: the interfaces of one device are one sighting.
-	if paths, err := usbscan.FindAll(); err == nil {
-		byKey := map[string]*sighting{}
-		var keys []string
-		linked := map[string]bool{}
-		for _, p := range paths {
-			k := usbscan.DeviceKey(p.Path)
-			if k == skip.USBKey && skip.USBKey != "" {
-				continue
-			}
-			s := byKey[k]
-			if s == nil {
-				s = &sighting{keys: usbKeys(k), devKey: k}
-				byKey[k] = s
-				keys = append(keys, k)
-			}
-			s.usb = append(s.usb, p.Path)
-			if p.Present || p.Linked {
-				linked[k] = true
-			}
-		}
-		for _, k := range keys {
-			s := byKey[k]
-			if !linked[k] {
-				// Neither present nor linked: listed as not answering,
-				// without a probe.
-				sights = append(sights, *s)
-				continue
-			}
-			if c, ok := skip.Cache.get(s.keys.key); ok && c.linked && (c.answering || now.Sub(c.at) < reprobeAfter) {
-				s.caps, s.answering = c.caps, c.answering
-			} else {
-				s.caps = probeUSB(ctx, s.usb, logf)
-				s.answering = s.caps != nil
-				skip.Cache.put(s.keys.key, probe{caps: s.caps, answering: s.answering, linked: true, at: now})
-			}
-			sights = append(sights, *s)
-		}
-		// A device that went away is relinked when it comes back.
-		for _, k := range keys {
-			if !linked[k] {
-				skip.Cache.put(byKey[k].keys.key, probe{linked: false, at: now})
-			}
-		}
-	}
+	sights = append(sights, lookUSB(ctx, skip, now, logf)...)
 
 	var net []sighting
 	if address != "" {
@@ -238,7 +307,7 @@ func Look(ctx context.Context, address string, skip Skip, known map[string]strin
 			net = append(net, s)
 		}
 	}
-	svcs, err := mdns.Browse(ctx, 2*time.Second)
+	svcs, err := browseMDNS(ctx, 2*time.Second)
 	if err != nil {
 		logf("mDNS search failed: %v", err)
 	}
@@ -272,6 +341,53 @@ func Look(ctx context.Context, address string, skip Skip, known map[string]strin
 	wg.Wait()
 	sights = append(sights, net...)
 	return mergeSightings(sights, known)
+}
+
+// lookUSB lists the USB scanners present: the interfaces of one device are
+// one sighting, named after the device. skip's device is left alone. A
+// device is probed unless the cache has a probe of it under 5 minutes old.
+func lookUSB(ctx context.Context, skip Skip, now time.Time, logf func(string, ...any)) []sighting {
+	paths, err := findUSB()
+	if err != nil {
+		return nil
+	}
+	present := map[string]bool{}
+	if skip.USBKey != "" {
+		present[usbKeys(skip.USBKey).key] = true
+	}
+	byKey := map[string]*sighting{}
+	var keys []string
+	for _, p := range paths {
+		k := usbscan.DeviceKey(p.Path)
+		present[usbKeys(k).key] = true
+		if k == skip.USBKey && skip.USBKey != "" {
+			continue
+		}
+		s := byKey[k]
+		if s == nil {
+			s = &sighting{keys: usbKeys(k), devKey: k}
+			byKey[k] = s
+			keys = append(keys, k)
+		}
+		s.usb = append(s.usb, p.Path)
+		if s.name == "" {
+			s.name = strings.TrimSpace(p.Name)
+		}
+	}
+	skip.Cache.forgetUSB(present)
+	var out []sighting
+	for _, k := range keys {
+		s := byKey[k]
+		if c, ok := skip.Cache.get(s.keys.key); ok && now.Sub(c.at) < reprobeAfter {
+			s.caps, s.answering, s.reason = c.caps, c.answering, c.reason
+		} else {
+			s.caps, s.reason = probeUSB(ctx, s.usb, logf)
+			s.answering = s.caps != nil
+			skip.Cache.put(s.keys.key, probe{caps: s.caps, answering: s.answering, reason: s.reason, at: now})
+		}
+		out = append(out, *s)
+	}
+	return out
 }
 
 // skipped reports a base that skip names.
@@ -341,11 +457,15 @@ func mdnsSightings(svcs []mdns.Service, skip Skip, known map[string]string) []si
 }
 
 // probeUSB opens each path of one USB device in turn and reads its
-// capabilities (15 s), then closes it.
-func probeUSB(ctx context.Context, paths []string, logf func(string, ...any)) *escl.Capabilities {
+// capabilities (15 s), then closes it. When none answered, reason says why
+// if the errors tell.
+func probeUSB(ctx context.Context, paths []string, logf func(string, ...any)) (caps *escl.Capabilities, reason string) {
+	var errs []error
 	for _, p := range paths {
-		port, err := usbscan.Open(p)
+		port, err := openUSB(p)
 		if err != nil {
+			logf("USB interface %s did not open: %v", p, err)
+			errs = append(errs, err)
 			continue
 		}
 		c := escl.NewClient(escl.NewStreamDoer(port), "eSCL")
@@ -354,11 +474,12 @@ func probeUSB(ctx context.Context, paths []string, logf func(string, ...any)) *e
 		cancel()
 		port.Close()
 		if err == nil {
-			return caps
+			return caps, ""
 		}
 		logf("USB interface %s did not answer eSCL: %v", p, err)
+		errs = append(errs, err)
 	}
-	return nil
+	return nil, attachedReason(usbReason(errs), paths)
 }
 
 // probeBase reads a network scanner's capabilities (8 s).
@@ -374,7 +495,8 @@ func probeBase(ctx context.Context, base, root string) (*escl.Capabilities, erro
 }
 
 // mergeSightings identifies each sighting and merges those with the same
-// id: USB first, Via the union, Answering if any sighting answered. Two
+// id: USB first, Via the union, Answering if any sighting answered (and
+// then no Reason, else the strongest one). Two
 // USB entries with one name get the details "USB 1", "USB 2" in DeviceKey
 // order.
 func mergeSightings(sights []sighting, known map[string]string) []Found {
@@ -415,6 +537,9 @@ func mergeSightings(sights []sighting, known map[string]string) []Found {
 		f.USB = append(f.USB, s.usb...)
 		f.Net = append(f.Net, s.net...)
 		f.Answering = f.Answering || s.answering
+		if reasonRank(s.reason) > reasonRank(f.Reason) {
+			f.Reason = s.reason
+		}
 		f.typed = f.typed || s.typed
 		f.mdns = f.mdns || s.mdns
 		if f.devKey == "" {
@@ -424,6 +549,9 @@ func mergeSightings(sights []sighting, known map[string]string) []Found {
 	out := make([]Found, 0, len(order))
 	for _, id := range order {
 		f := byID[id]
+		if f.Answering {
+			f.Reason = ""
+		}
 		if f.Name == "" {
 			if len(f.USB) > 0 {
 				f.Name = "USB scanner"
@@ -493,12 +621,16 @@ func autoOrder(found []Found) []Found {
 }
 
 // OpenFound opens one scanner from the list: its USB paths first, then its
-// network addresses. A device whose id is not f.ID is refused.
+// network addresses. A device whose id is not f.ID is refused. When nothing
+// opened and the USB tries say why, the error is a *usbError.
 func OpenFound(ctx context.Context, f Found, logf func(string, ...any)) (*Scanner, error) {
 	var last error = errors.New("the scanner has no address")
+	var usbErrs []error
 	for _, p := range f.USB {
-		port, err := usbscan.Open(p)
+		port, err := openUSB(p)
 		if err != nil {
+			logf("USB interface %s did not open: %v", p, err)
+			usbErrs = append(usbErrs, err)
 			last = err
 			continue
 		}
@@ -509,6 +641,7 @@ func OpenFound(ctx context.Context, f Found, logf func(string, ...any)) (*Scanne
 		if err != nil {
 			logf("USB interface %s did not answer eSCL: %v", p, err)
 			port.Close()
+			usbErrs = append(usbErrs, err)
 			last = err
 			continue
 		}
@@ -516,9 +649,14 @@ func OpenFound(ctx context.Context, f Found, logf func(string, ...any)) (*Scanne
 		if id != f.ID {
 			port.Close()
 			last = fmt.Errorf("the scanner at %s is another scanner now", p)
+			usbErrs = append(usbErrs, last)
 			continue
 		}
-		s := newScanner("USB", caps, p, c, func() { port.Close() }, "USB scanner")
+		fallback := "USB scanner"
+		if f.Name != "" {
+			fallback = f.Name
+		}
+		s := newScanner("USB", caps, p, c, func() { port.Close() }, fallback)
 		s.ID, s.Stable, s.Via = id, stable, f.Via()
 		if fromCaps {
 			s.learned = map[string]string{usbKeys(usbscan.DeviceKey(p)).key: id}
@@ -544,6 +682,9 @@ func OpenFound(ctx context.Context, f Found, logf func(string, ...any)) (*Scanne
 			s.learned = map[string]string{b.keys.key: id}
 		}
 		return s, nil
+	}
+	if r := attachedReason(usbReason(usbErrs), f.USB); r != "" {
+		return nil, &usbError{Reason: r, Err: last}
 	}
 	return nil, last
 }

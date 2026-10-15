@@ -5,6 +5,7 @@ package usbscan
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -13,19 +14,14 @@ import (
 	"github.com/sallyerp/sally-print-agent/internal/escl"
 )
 
-// Everything here goes through package syscall and lazily loaded DLLs: no
-// cgo and no golang.org/x/sys.
+// Everything here goes through package syscall: no cgo and no
+// golang.org/x/sys. cfgmgr32.dll is loaded from System32 only.
 var (
 	kernel32                = syscall.NewLazyDLL("kernel32.dll")
 	procCreateEventW        = kernel32.NewProc("CreateEventW")
 	procGetOverlappedResult = kernel32.NewProc("GetOverlappedResult")
 	procCancelIoEx          = kernel32.NewProc("CancelIoEx")
-
-	setupapi                             = syscall.NewLazyDLL("setupapi.dll")
-	procSetupDiGetClassDevsW             = setupapi.NewProc("SetupDiGetClassDevsW")
-	procSetupDiEnumDeviceInterfaces      = setupapi.NewProc("SetupDiEnumDeviceInterfaces")
-	procSetupDiGetDeviceInterfaceDetailW = setupapi.NewProc("SetupDiGetDeviceInterfaceDetailW")
-	procSetupDiDestroyDeviceInfoList     = setupapi.NewProc("SetupDiDestroyDeviceInfoList")
+	procLoadLibraryExW      = kernel32.NewProc("LoadLibraryExW")
 )
 
 const (
@@ -36,18 +32,21 @@ const (
 	openExisting      = 3
 	fileFlagOverlaped = 0x40000000
 
-	keyRead = 0x20019
-
-	digcfPresent         = 0x2
-	digcfDeviceInterface = 0x10
-
-	errorNoMoreItems        = syscall.Errno(259)
-	errorInsufficientBuffer = syscall.Errno(122)
-	errorOperationAborted   = syscall.Errno(995)
-	errorHandleEOF          = syscall.Errno(38)
+	errorOperationAborted = syscall.Errno(995)
+	errorHandleEOF        = syscall.Errno(38)
 
 	waitObject0 = 0
 	waitTimeout = 258
+
+	loadLibrarySearchSystem32 = 0x800
+
+	// CONFIGRET values.
+	crSuccess     = 0
+	crBufferSmall = 0x1A
+	crNoSuchValue = 0x25
+
+	// CM_LOCATE_DEVNODE_PHANTOM: also a device that is not present.
+	cmLocateDevnodePhantom = 1
 )
 
 type guid struct {
@@ -60,132 +59,278 @@ type guid struct {
 // ippUSB is {f2f40381-f46d-4e51-bce7-62de6cf2d098}.
 var ippUSB = guid{0xf2f40381, 0xf46d, 0x4e51, [8]byte{0xbc, 0xe7, 0x62, 0xde, 0x6c, 0xf2, 0xd0, 0x98}}
 
-// Find lists candidate device paths, best first.
-func Find() ([]string, error) {
-	present, _ := setupAPIPaths()
-	linked, other, regErr := registryPaths()
-	out := order(present, linked, other)
-	if len(out) == 0 && regErr != nil {
-		return nil, regErr
-	}
-	return out, nil
+// devpropKey mirrors DEVPROPKEY.
+type devpropKey struct {
+	fmtid guid
+	pid   uint32
 }
 
-// FindAll lists every IPP-over-USB interface the PC knows about, present or
-// not, best first, for the scanner list. Present comes from SetupAPI and
-// Linked from the registry.
-func FindAll() ([]Path, error) {
-	present, _ := setupAPIPaths()
-	linked, other, regErr := registryPaths()
-	out := classify(present, linked, other)
-	if len(out) == 0 && regErr != nil {
-		return nil, regErr
-	}
-	return out, nil
+var (
+	// DEVPKEY_Device_InstanceId {78c34fc8-104a-4aca-9ea4-524d52996e57} 256.
+	keyInstanceID = devpropKey{guid{0x78c34fc8, 0x104a, 0x4aca, [8]byte{0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}}, 256}
+	// DEVPKEY_Device_CompatibleIds {a45c254e-df1c-4efd-8020-67d146a850e0} 4.
+	keyCompatibleIDs = devpropKey{guid{0xa45c254e, 0xdf1c, 0x4efd, [8]byte{0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 4}
+	// DEVPKEY_Device_BusReportedDeviceDesc {540b947e-8b40-45bc-a8a2-6a0b894cbda2} 4.
+	keyBusReportedDeviceDesc = devpropKey{guid{0x540b947e, 0x8b40, 0x45bc, [8]byte{0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2}}, 4}
+)
+
+// cfgmgr holds the configuration manager calls, each found once.
+type cfgmgr struct {
+	listSize, list, ifaceProp, locate, nodeProp, parent, status *syscall.Proc
 }
 
-// spDeviceInterfaceData mirrors SP_DEVICE_INTERFACE_DATA.
-type spDeviceInterfaceData struct {
-	cbSize   uint32
-	guid     guid
-	flags    uint32
-	reserved uintptr
-}
+var (
+	cfgOnce sync.Once
+	cfg     *cfgmgr
+	cfgErr  error
+)
 
-// setupAPIPaths asks SetupAPI for present IPP-over-USB interfaces. On the
-// machine this was built against it found nothing; the registry is the
-// fallback that did.
-func setupAPIPaths() ([]string, error) {
-	if err := procSetupDiGetClassDevsW.Find(); err != nil {
-		return nil, err
-	}
-	devs, _, err := procSetupDiGetClassDevsW.Call(uintptr(unsafe.Pointer(&ippUSB)), 0, 0, digcfPresent|digcfDeviceInterface)
-	if devs == 0 || devs == ^uintptr(0) {
-		return nil, err
-	}
-	defer procSetupDiDestroyDeviceInfoList.Call(devs)
-
-	// SP_DEVICE_INTERFACE_DETAIL_DATA_W.cbSize: 8 on 64-bit, 6 on 32-bit.
-	detailCb := uint32(6)
-	if unsafe.Sizeof(uintptr(0)) == 8 {
-		detailCb = 8
-	}
-	var out []string
-	for i := uint32(0); i < 64; i++ {
-		data := &spDeviceInterfaceData{}
-		data.cbSize = uint32(unsafe.Sizeof(*data))
-		r, _, _ := procSetupDiEnumDeviceInterfaces.Call(devs, 0, uintptr(unsafe.Pointer(&ippUSB)), uintptr(i), uintptr(unsafe.Pointer(data)))
-		if r == 0 {
-			break
+// loadCfgmgr loads cfgmgr32.dll from System32 and finds its calls. A
+// missing call is an error, never a panic.
+func loadCfgmgr() (*cfgmgr, error) {
+	cfgOnce.Do(func() {
+		if err := procLoadLibraryExW.Find(); err != nil {
+			cfgErr = err
+			return
 		}
-		var need uint32
-		procSetupDiGetDeviceInterfaceDetailW.Call(devs, uintptr(unsafe.Pointer(data)), 0, 0, uintptr(unsafe.Pointer(&need)), 0)
-		if need < 8 || need > 64<<10 {
-			continue
-		}
-		// []uint64 for alignment of the DWORD at the front.
-		buf := make([]uint64, (need+7)/8)
-		*(*uint32)(unsafe.Pointer(&buf[0])) = detailCb
-		r, _, _ = procSetupDiGetDeviceInterfaceDetailW.Call(devs, uintptr(unsafe.Pointer(data)), uintptr(unsafe.Pointer(&buf[0])), uintptr(need), 0, 0)
-		if r == 0 {
-			continue
-		}
-		chars := unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(&buf[0]), 4)), (need-4)/2)
-		if p := syscall.UTF16ToString(chars); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out, nil
-}
-
-// registryPaths reads DeviceClasses\{f2f40381-…}. linked are interfaces with
-// "#\Control" Linked = 1; other are the rest (possibly a scanner unplugged).
-func registryPaths() (linked, other []string, err error) {
-	keyPath, _ := syscall.UTF16PtrFromString(`SYSTEM\CurrentControlSet\Control\DeviceClasses\` + InterfaceGUID)
-	var h syscall.Handle
-	if err := syscall.RegOpenKeyEx(syscall.HKEY_LOCAL_MACHINE, keyPath, 0, keyRead, &h); err != nil {
-		return nil, nil, fmt.Errorf("usbscan: no IPP-over-USB interfaces registered: %w", err)
-	}
-	defer syscall.RegCloseKey(h)
-
-	for i := uint32(0); i < 256; i++ {
-		buf := make([]uint16, 512)
-		n := uint32(len(buf))
-		err := syscall.RegEnumKeyEx(h, i, &buf[0], &n, nil, nil, nil, nil)
+		name, err := syscall.UTF16PtrFromString("cfgmgr32.dll")
 		if err != nil {
-			if !errors.Is(err, errorNoMoreItems) {
-				return linked, other, err
+			cfgErr = err
+			return
+		}
+		h, _, e := procLoadLibraryExW.Call(uintptr(unsafe.Pointer(name)), 0, loadLibrarySearchSystem32)
+		if h == 0 {
+			cfgErr = fmt.Errorf("usbscan: loading cfgmgr32.dll: %v", e)
+			return
+		}
+		d := &syscall.DLL{Name: "cfgmgr32.dll", Handle: syscall.Handle(h)}
+		c := &cfgmgr{}
+		for _, p := range []struct {
+			to   **syscall.Proc
+			name string
+		}{
+			{&c.listSize, "CM_Get_Device_Interface_List_SizeW"},
+			{&c.list, "CM_Get_Device_Interface_ListW"},
+			{&c.ifaceProp, "CM_Get_Device_Interface_PropertyW"},
+			{&c.locate, "CM_Locate_DevNodeW"},
+			{&c.nodeProp, "CM_Get_DevNode_PropertyW"},
+			{&c.parent, "CM_Get_Parent"},
+			{&c.status, "CM_Get_DevNode_Status"},
+		} {
+			proc, err := d.FindProc(p.name)
+			if err != nil {
+				cfgErr = err
+				return
 			}
-			break
+			*p.to = proc
 		}
-		name := syscall.UTF16ToString(buf[:n])
-		path, ok := pathFromKey(name)
-		if !ok {
-			continue
-		}
-		if isLinked(h, name+`\#\Control`) {
-			linked = append(linked, path)
-		} else {
-			other = append(other, path)
-		}
-	}
-	return linked, other, nil
+		cfg = c
+	})
+	return cfg, cfgErr
 }
 
-func isLinked(parent syscall.Handle, sub string) bool {
-	p, _ := syscall.UTF16PtrFromString(sub)
-	var k syscall.Handle
-	if syscall.RegOpenKeyEx(parent, p, 0, keyRead, &k) != nil {
+// crError is a CONFIGRET other than success.
+type crError struct {
+	op   string
+	code uintptr
+}
+
+func (e *crError) Error() string { return fmt.Sprintf("usbscan: %s: CONFIGRET 0x%X", e.op, e.code) }
+
+// FindAll lists the IPP-over-USB interfaces present now, sorted by path,
+// each named after its USB device.
+func FindAll() ([]Path, error) {
+	paths, err := presentInterfaces(&ippUSB)
+	if err != nil {
+		return nil, err
+	}
+	return pickIPPUSB(paths, describe), nil
+}
+
+// presentInterfaces lists the present interfaces of class g. The list can
+// grow between the size and the read; that is tried 3 times.
+func presentInterfaces(g *guid) ([]string, error) {
+	c, err := loadCfgmgr()
+	if err != nil {
+		return nil, err
+	}
+	for try := 0; try < 3; try++ {
+		var n uint32
+		// Flags 0: CM_GET_DEVICE_INTERFACE_LIST_PRESENT. n counts UTF-16
+		// units, 1 for an empty list.
+		r, _, _ := c.listSize.Call(uintptr(unsafe.Pointer(&n)), uintptr(unsafe.Pointer(g)), 0, 0)
+		if r != crSuccess {
+			return nil, &crError{"CM_Get_Device_Interface_List_SizeW", r}
+		}
+		if n == 0 {
+			n = 1
+		}
+		buf := make([]uint16, n)
+		r, _, _ = c.list.Call(uintptr(unsafe.Pointer(g)), 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(n), 0)
+		switch r {
+		case crSuccess:
+			return splitMultiSz(buf), nil
+		case crBufferSmall:
+			continue
+		default:
+			return nil, &crError{"CM_Get_Device_Interface_ListW", r}
+		}
+	}
+	return nil, &crError{"CM_Get_Device_Interface_ListW", crBufferSmall}
+}
+
+// readProp reads one property by two calls: the size, then the value. call
+// makes one call with the given pointers (buf nil for the size). A missing
+// property is nil, not an error.
+func readProp(op string, call func(typ *uint32, buf *uint16, size *uint32) uintptr) ([]string, error) {
+	var typ, size uint32
+	r := call(&typ, nil, &size)
+	switch {
+	case r == crNoSuchValue:
+		return nil, nil
+	case r == crSuccess || (r == crBufferSmall && size == 0):
+		return nil, nil
+	case r != crBufferSmall:
+		return nil, &crError{op, r}
+	}
+	buf := make([]uint16, (size+1)/2)
+	r = call(&typ, &buf[0], &size)
+	if r == crNoSuchValue {
+		return nil, nil
+	}
+	if r != crSuccess {
+		return nil, &crError{op, r}
+	}
+	return splitMultiSz(buf), nil
+}
+
+func (c *cfgmgr) interfaceProp(path *uint16, key *devpropKey) ([]string, error) {
+	return readProp("CM_Get_Device_Interface_PropertyW", func(typ *uint32, buf *uint16, size *uint32) uintptr {
+		r, _, _ := c.ifaceProp.Call(uintptr(unsafe.Pointer(path)), uintptr(unsafe.Pointer(key)),
+			uintptr(unsafe.Pointer(typ)), uintptr(unsafe.Pointer(buf)), uintptr(unsafe.Pointer(size)), 0)
+		return r
+	})
+}
+
+func (c *cfgmgr) devNodeProp(dn uint32, key *devpropKey) ([]string, error) {
+	return readProp("CM_Get_DevNode_PropertyW", func(typ *uint32, buf *uint16, size *uint32) uintptr {
+		r, _, _ := c.nodeProp.Call(uintptr(dn), uintptr(unsafe.Pointer(key)),
+			uintptr(unsafe.Pointer(typ)), uintptr(unsafe.Pointer(buf)), uintptr(unsafe.Pointer(size)), 0)
+		return r
+	})
+}
+
+func (c *cfgmgr) locateNode(inst string, flags uintptr) (uint32, error) {
+	p, err := syscall.UTF16PtrFromString(inst)
+	if err != nil {
+		return 0, err
+	}
+	var dn uint32
+	r, _, _ := c.locate.Call(uintptr(unsafe.Pointer(&dn)), uintptr(unsafe.Pointer(p)), flags)
+	if r != crSuccess {
+		return 0, &crError{"CM_Locate_DevNodeW", r}
+	}
+	return dn, nil
+}
+
+func (c *cfgmgr) parentOf(dn uint32) (uint32, error) {
+	var p uint32
+	r, _, _ := c.parent.Call(uintptr(unsafe.Pointer(&p)), uintptr(dn), 0)
+	if r != crSuccess {
+		return 0, &crError{"CM_Get_Parent", r}
+	}
+	return p, nil
+}
+
+func first(s []string, err error) string {
+	if err != nil || len(s) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[0])
+}
+
+// describe reads an interface's device instance id, its compatible ids and
+// its name: the parent device's for one function of a composite device
+// (its own may be a label like "Printer"), else or if that is blank its
+// own.
+func describe(path string) (inst string, compat []string, name string, err error) {
+	c, err := loadCfgmgr()
+	if err != nil {
+		return "", nil, "", err
+	}
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return "", nil, "", err
+	}
+	ids, err := c.interfaceProp(p, &keyInstanceID)
+	if err != nil {
+		return "", nil, "", err
+	}
+	if len(ids) == 0 || ids[0] == "" {
+		return "", nil, "", errors.New("usbscan: the interface has no device instance id")
+	}
+	inst = ids[0]
+	dn, err := c.locateNode(inst, 0)
+	if err != nil {
+		return inst, nil, "", err
+	}
+	compat, err = c.devNodeProp(dn, &keyCompatibleIDs)
+	if err != nil {
+		return inst, nil, "", err
+	}
+	if isChild(inst) {
+		if pdn, perr := c.parentOf(dn); perr == nil {
+			name = first(c.devNodeProp(pdn, &keyBusReportedDeviceDesc))
+		}
+	}
+	if name == "" {
+		name = first(c.devNodeProp(dn, &keyBusReportedDeviceDesc))
+	}
+	return inst, compat, name, nil
+}
+
+// Attached reports that the USB device of path is plugged in, even when
+// the interface itself is not present (the device switched to its maker's
+// mode: the PI_ function is a phantom, its parent present).
+func Attached(path string) bool {
+	parts := strings.Split(path, "#")
+	if len(parts) < 4 {
 		return false
 	}
-	defer syscall.RegCloseKey(k)
-	name, _ := syscall.UTF16PtrFromString("Linked")
-	var typ, val uint32
-	size := uint32(4)
-	if syscall.RegQueryValueEx(k, name, nil, &typ, (*byte)(unsafe.Pointer(&val)), &size) != nil {
+	head := parts[0]
+	if len(head) > 4 && (head[:4] == `\\?\` || head[:4] == `\\.\`) {
+		head = head[4:]
+	}
+	inst := head + `\` + parts[1] + `\` + parts[2]
+	c, err := loadCfgmgr()
+	if err != nil {
 		return false
 	}
-	return val == 1
+	dn, err := c.locateNode(inst, cmLocateDevnodePhantom)
+	if err != nil {
+		return false
+	}
+	if isChild(inst) {
+		if dn, err = c.parentOf(dn); err != nil {
+			return false
+		}
+	}
+	var st, prob uint32
+	r, _, _ := c.status.Call(uintptr(unsafe.Pointer(&st)), uintptr(unsafe.Pointer(&prob)), uintptr(dn), 0)
+	return r == crSuccess
+}
+
+func refusedErrno(err error) bool {
+	var e syscall.Errno
+	// ERROR_SHARING_VIOLATION, ERROR_BUSY.
+	return errors.As(err, &e) && (e == 32 || e == 170)
+}
+
+func goneErrno(err error) bool {
+	var e syscall.Errno
+	// ERROR_DEV_NOT_EXIST, ERROR_NO_SUCH_DEVICE, ERROR_DEVICE_NOT_CONNECTED,
+	// ERROR_DEVICE_REMOVED.
+	return errors.As(err, &e) && (e == 55 || e == 433 || e == 1167 || e == 1617)
 }
 
 // port is an open IPP-over-USB channel.
