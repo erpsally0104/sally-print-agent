@@ -123,3 +123,17 @@ func TestRefusedAndGone(t *testing.T) {
 		t.Fatal("Gone")
 	}
 }
+
+func TestAnOrphansRootParentIsNotItsUSBDevice(t *testing.T) {
+	if parentIsUSB(`HTREE\ROOT\0`) {
+		t.Fatal("the device-tree root is not a USB device")
+	}
+	if parentIsUSB("") {
+		t.Fatal("no parent id is not a USB device")
+	}
+	for _, id := range []string{`usb\vid_03f0&pid_5c05\cn12ab34cd`, `USB\VID_03F0&PID_5C05\CN12AB34CD`} {
+		if !parentIsUSB(id) {
+			t.Fatalf("%q is a USB device", id)
+		}
+	}
+}

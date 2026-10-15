@@ -314,6 +314,9 @@ func Attached(path string) bool {
 		if dn, err = c.parentOf(dn); err != nil {
 			return false
 		}
+		if !parentIsUSB(first(c.devNodeProp(dn, &keyInstanceID))) {
+			return false
+		}
 	}
 	var st, prob uint32
 	r, _, _ := c.status.Call(uintptr(unsafe.Pointer(&st)), uintptr(unsafe.Pointer(&prob)), uintptr(dn), 0)

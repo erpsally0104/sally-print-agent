@@ -164,6 +164,13 @@ func isChild(s string) bool {
 	return strings.Contains(l, "&pi_") || strings.Contains(l, "&mi_")
 }
 
+// parentIsUSB reports a parent instance id that is a USB device. The
+// parent of an orphaned phantom function is the root of the device tree
+// (DEVPKEY_Device_Parent, Windows 8 and later), which is always present.
+func parentIsUSB(id string) bool {
+	return strings.HasPrefix(lower(id), `usb\`)
+}
+
 // DeviceKey names the USB device a path belongs to, so the interfaces of
 // one scanner (PI_00 and PI_01, or MI_00 and MI_01) group as one:
 //
