@@ -221,6 +221,8 @@ func (f Found) Kind() string {
 type Skip struct {
 	Bases  []string
 	USBKey string
+	// ID is the open scanner's id: the one entry the list leaves alone.
+	ID string
 	// Cache, when set, lets Look reuse recent probes (inventoryLoop).
 	Cache *ProbeCache
 	// Seen holds the sighting keys of scanners already on the list, which

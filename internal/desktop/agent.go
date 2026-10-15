@@ -1473,12 +1473,12 @@ func (a *Agent) openedLocked(sc *Scanner) {
 }
 
 // skipOf is what the scanner list must leave alone while sc is open: its
-// USB device, or its network base.
+// USB device, or its network base, and its entry.
 func skipOf(sc *Scanner) Skip {
 	if sc.Kind == "USB" {
-		return Skip{USBKey: usbscan.DeviceKey(sc.Where)}
+		return Skip{USBKey: usbscan.DeviceKey(sc.Where), ID: sc.ID}
 	}
-	return Skip{Bases: []string{sc.Where}}
+	return Skip{Bases: []string{sc.Where}, ID: sc.ID}
 }
 
 // sleep waits d, or less if the scanner address changed. False when ctx ends.

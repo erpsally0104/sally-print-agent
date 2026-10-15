@@ -18,10 +18,12 @@ choice), never while a pile scans. Sightings with the same id are one entry
 chosen one; the open scanner is never probed by the list, and is listed as
 answering while the agent talks to it.
 
-An entry is judged only when the Look looked for it: one whose USB device
-or network base the Look left alone keeps what it had. An unseen entry
-whose USB device the pass listed (it may answer under another id now) has
-the reason that device's last probe gave. An unseen USB-only entry whose
+The open scanner's entry is never judged by a pass, even one whose Look
+began while it was open. Another entry on the device the Look left alone
+(a twin under an older id) is unseen with its device listed: no reason,
+since the device's probe may be older than the open, and a miss. An unseen
+entry whose USB device the pass listed (it may answer under another id
+now) has the reason that device's last probe gave. An unseen USB-only entry whose
 device is not listed is not found on USB, or held by Windows when its USB
 device is still plugged in; one also reached over the network keeps its
 reason, which openChosen sets by the same rules.
@@ -96,7 +98,7 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	var unseen []Found
 	a.mu.Lock()
 	for _, f := range a.inventory {
-		if !seen[f.ID] && len(f.USB) > 0 && !skip.names(f) && (a.inUse == nil || a.inUse.ID != f.ID) {
+		if !seen[f.ID] && len(f.USB) > 0 && !skip.leaves(f) && (a.inUse == nil || a.inUse.ID != f.ID) {
 			unseen = append(unseen, f)
 		}
 	}
@@ -117,6 +119,9 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 			if k := usbscan.DeviceKey(p); p != "" && present[k] {
 				listed = true
 				reasons[f.ID] = ""
+				if k == skip.USBKey {
+					break // the open scanner's device answers
+				}
 				if c, ok := a.probes.get(usbKeys(k).key); ok && !c.answering {
 					reasons[f.ID] = c.reason
 				}
@@ -164,7 +169,7 @@ func (a *Agent) mergeInventoryLocked(found []Found, now time.Time) bool {
 }
 
 // mergeSeenLocked is mergeInventoryLocked for a Look that left skip alone:
-// an unseen entry skip names is not judged. reasons says why unseen USB
+// the open scanner's entry it names is not judged. reasons says why unseen USB
 // entries cannot be used; without one a USB-only entry is not found, and
 // one also reached over the network keeps its reason.
 func (a *Agent) mergeSeenLocked(found []Found, now time.Time, reasons map[string]string, skip Skip) bool {
@@ -197,7 +202,7 @@ func (a *Agent) mergeSeenLocked(found []Found, now time.Time, reasons map[string
 		if seen[p.ID] {
 			continue
 		}
-		if p.ID != inUse && !skip.names(p) {
+		if p.ID != inUse && !skip.leaves(p) {
 			p.Misses++
 			p.Answering = false
 			if len(p.USB) == 0 {
@@ -219,24 +224,9 @@ func (a *Agent) mergeSeenLocked(found []Found, now time.Time, reasons map[string
 	return signature(a.inventory) != before
 }
 
-// names reports an entry whose USB device or network base the Look left
-// alone.
-func (s Skip) names(f Found) bool {
-	if s.USBKey != "" {
-		for _, p := range f.USB {
-			if p != "" && usbscan.DeviceKey(p) == s.USBKey {
-				return true
-			}
-		}
-	}
-	for _, b := range f.Net {
-		for _, u := range s.Bases {
-			if strings.EqualFold(b.URL, u) {
-				return true
-			}
-		}
-	}
-	return false
+// leaves reports the open scanner's entry, which a pass does not judge.
+func (s Skip) leaves(f Found) bool {
+	return s.ID != "" && f.ID == s.ID
 }
 
 // mergeInUseLocked puts the open scanner on the list, answering while the

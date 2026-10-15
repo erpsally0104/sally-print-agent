@@ -7,6 +7,7 @@ package desktop
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/sallyerp/sally-print-agent/internal/usbscan"
 )
@@ -76,5 +77,47 @@ func TestADeviceThatAnswersAsAnotherScannerIsNotHeldByWindows(t *testing.T) {
 	}
 	if f, ok := a.foundLocked(ScannerID("uuid:" + usbUUID)); !ok || !f.Answering {
 		t.Fatalf("the UUID entry: %+v %v", f, ok)
+	}
+}
+
+// The open USB scanner's twin under its last-resort id, left from a probe
+// Windows refused, is judged by the passes: it says no reason, and goes
+// after 3 of them.
+func TestTheOpenScannersStaleTwinIsJudgedAndDropped(t *testing.T) {
+	installUSB(t, n4000(answers, answers)).set(func(u *fakeUSB) { u.attached = true })
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	a.opt.Look = Look
+	ctx := context.Background()
+	key := usbKeys(usbscan.DeviceKey(n4000PI0)).key
+	id, twin := ScannerID("uuid:"+usbUUID), ScannerID(key)
+	paths := []string{n4000PI0, n4000PI1}
+	a.mergeInventoryLocked([]Found{
+		{ID: id, Name: n4000Name, USB: paths, Answering: true, Stable: true},
+		{ID: twin, Name: n4000Name, USB: paths, Reason: ReasonWindows},
+	}, time.Now())
+	a.probes.put(key, probe{reason: ReasonWindows, at: time.Now()}) // older than the open
+	a.local.ScannerID = id
+	f, _ := a.foundLocked(id)
+	sc, err := OpenFound(ctx, f, a.logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.Close()
+	a.mu.Lock()
+	a.openedLocked(sc)
+	a.mu.Unlock()
+
+	for i := 1; i <= dropAfterMisses; i++ {
+		a.inventoryPass(ctx)
+		if g, ok := a.foundLocked(id); !ok || !g.Answering || g.Reason != "" {
+			t.Fatalf("pass %d, the open scanner: %+v %v", i, g, ok)
+		}
+		g, ok := a.foundLocked(twin)
+		if i < dropAfterMisses && (!ok || g.Answering || g.Reason != "" || g.Misses != i) {
+			t.Fatalf("pass %d, the twin: %+v %v", i, g, ok)
+		}
+		if i == dropAfterMisses && ok {
+			t.Fatalf("pass %d, the twin is still listed: %+v", i, g)
+		}
 	}
 }
