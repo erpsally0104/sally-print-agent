@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sallyerp/sally-print-agent/internal/sally"
+	"github.com/sallyerp/sally-print-agent/internal/usbscan"
 )
 
 /*
@@ -15,9 +16,15 @@ The scanner list. inventoryLoop looks for every scanner the PC can reach
 choice), never while a pile scans. Sightings with the same id are one entry
 (identity.go). An entry unseen for 3 passes is dropped, unless it is the
 chosen one; the open scanner is never probed by the list, and is listed as
-answering while the agent talks to it. An unseen USB-only entry is listed
-as not found on USB, or as held by Windows when its USB device is still
-plugged in.
+answering while the agent talks to it.
+
+An entry is judged only when the Look looked for it: one whose USB device
+or network base the Look left alone keeps what it had. An unseen entry
+whose USB device the pass listed (it may answer under another id now) has
+the reason that device's last probe gave. An unseen USB-only entry whose
+device is not listed is not found on USB, or held by Windows when its USB
+device is still plugged in; one also reached over the network keeps its
+reason, which openChosen sets by the same rules.
 */
 
 // maxScanners is the most the heartbeat lists.
@@ -76,8 +83,10 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 		return
 	}
 
-	// The attached rule for the USB-only entries this pass did not see,
-	// worked out outside a.mu.
+	// Why the USB entries this pass did not see cannot be used, worked out
+	// outside a.mu: only a device that is not listed is not found, or held
+	// by Windows when it is still plugged in. A listed device says what its
+	// last probe said, as openChosen does.
 	seen := map[string]bool{}
 	for _, f := range found {
 		seen[f.ID] = true
@@ -85,20 +94,40 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	var unseen []Found
 	a.mu.Lock()
 	for _, f := range a.inventory {
-		if !seen[f.ID] && len(f.USB) > 0 && len(f.Net) == 0 && (a.inUse == nil || a.inUse.ID != f.ID) {
+		if !seen[f.ID] && len(f.USB) > 0 && !skip.names(f) && (a.inUse == nil || a.inUse.ID != f.ID) {
 			unseen = append(unseen, f)
 		}
 	}
 	a.mu.Unlock()
-	attached := map[string]bool{}
+	present := map[string]bool{}
+	if skip.USBKey != "" {
+		present[skip.USBKey] = true
+	}
+	for _, f := range found {
+		for _, p := range f.USB {
+			present[usbscan.DeviceKey(p)] = true
+		}
+	}
+	reasons := map[string]string{}
 	for _, f := range unseen {
-		if attachedReason(ReasonNotFound, f.USB) == ReasonWindows {
-			attached[f.ID] = true
+		listed := false
+		for _, p := range f.USB {
+			if k := usbscan.DeviceKey(p); p != "" && present[k] {
+				listed = true
+				reasons[f.ID] = ""
+				if c, ok := a.probes.get(usbKeys(k).key); ok && !c.answering {
+					reasons[f.ID] = c.reason
+				}
+				break
+			}
+		}
+		if !listed && len(f.Net) == 0 {
+			reasons[f.ID] = attachedReason(ReasonNotFound, f.USB)
 		}
 	}
 
 	a.mu.Lock()
-	changed := a.mergeSeenLocked(found, a.opt.Now(), attached)
+	changed := a.mergeSeenLocked(found, a.opt.Now(), reasons, skip)
 	a.mu.Unlock()
 	if changed {
 		a.kickHeartbeat()
@@ -128,13 +157,14 @@ func signature(fs []Found) string {
 // answering, and the open scanner is kept answering. It remembers the ids
 // the capabilities gave, and reports whether the list changed.
 func (a *Agent) mergeInventoryLocked(found []Found, now time.Time) bool {
-	return a.mergeSeenLocked(found, now, nil)
+	return a.mergeSeenLocked(found, now, nil, Skip{})
 }
 
-// mergeSeenLocked is mergeInventoryLocked; attached names the unseen
-// USB-only entries whose USB device is still plugged in, which are held by
-// Windows rather than not found.
-func (a *Agent) mergeSeenLocked(found []Found, now time.Time, attached map[string]bool) bool {
+// mergeSeenLocked is mergeInventoryLocked for a Look that left skip alone:
+// an unseen entry skip names is not judged. reasons says why unseen USB
+// entries cannot be used; without one a USB-only entry is not found, and
+// one also reached over the network keeps its reason.
+func (a *Agent) mergeSeenLocked(found []Found, now time.Time, reasons map[string]string, skip Skip) bool {
 	before := signature(a.inventory)
 	prev := map[string]Found{}
 	for _, f := range a.inventory {
@@ -164,15 +194,16 @@ func (a *Agent) mergeSeenLocked(found []Found, now time.Time, attached map[strin
 		if seen[p.ID] {
 			continue
 		}
-		if p.ID != inUse {
+		if p.ID != inUse && !skip.names(p) {
 			p.Misses++
 			p.Answering = false
-			p.Reason = ""
-			if len(p.USB) > 0 && len(p.Net) == 0 {
+			if len(p.USB) == 0 {
+				p.Reason = ""
+			} else if len(p.Net) == 0 {
 				p.Reason = ReasonNotFound
-				if attached[p.ID] {
-					p.Reason = ReasonWindows
-				}
+			}
+			if r, ok := reasons[p.ID]; ok {
+				p.Reason = r
 			}
 		}
 		if p.Misses < dropAfterMisses || p.ID == a.local.ScannerID || p.ID == inUse {
@@ -183,6 +214,26 @@ func (a *Agent) mergeSeenLocked(found []Found, now time.Time, attached map[strin
 	a.mergeInUseLocked(now)
 	a.invPass = now
 	return signature(a.inventory) != before
+}
+
+// names reports an entry whose USB device or network base the Look left
+// alone.
+func (s Skip) names(f Found) bool {
+	if s.USBKey != "" {
+		for _, p := range f.USB {
+			if p != "" && usbscan.DeviceKey(p) == s.USBKey {
+				return true
+			}
+		}
+	}
+	for _, b := range f.Net {
+		for _, u := range s.Bases {
+			if strings.EqualFold(b.URL, u) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // mergeInUseLocked puts the open scanner on the list, answering while the
