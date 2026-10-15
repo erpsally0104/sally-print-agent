@@ -77,9 +77,11 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	}
 	a.mu.Unlock()
 
+	// lookMu is held through the merge, so a mark openChosen makes after
+	// this Look is never overwritten by it.
 	found := a.opt.Look(ctx, addr, skip, known, a.logf)
-	a.lookMu.Unlock()
 	if ctx.Err() != nil {
+		a.lookMu.Unlock()
 		return
 	}
 
@@ -129,6 +131,7 @@ func (a *Agent) inventoryPass(ctx context.Context) {
 	a.mu.Lock()
 	changed := a.mergeSeenLocked(found, a.opt.Now(), reasons, skip)
 	a.mu.Unlock()
+	a.lookMu.Unlock()
 	if changed {
 		a.kickHeartbeat()
 	}

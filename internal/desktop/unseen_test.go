@@ -6,7 +6,9 @@ package desktop
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sallyerp/sally-print-agent/internal/usbscan"
 )
@@ -144,5 +146,49 @@ func TestAPassKeepsTheReasonOfAChosenScannerAlsoOnTheNetwork(t *testing.T) {
 		if req, _ := a.report(); req.Scanner.Problem != notFound {
 			t.Fatalf("round %d: %q", i, req.Scanner.Problem)
 		}
+	}
+}
+
+// openChosen waits for a pass in its Look and marks the chosen entry once
+// that pass is done: the pass's merge must not put back what its Look saw.
+func TestAPassDoesNotUndoTheMarkOfAnOpenThatWaitedForIt(t *testing.T) {
+	installUSB(t, n4000(refusesRead, refusesRead))
+	attachedUSB = func(string) bool {
+		time.Sleep(200 * time.Millisecond)
+		return false
+	}
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	id := ScannerID("uuid:" + usbUUID)
+	chosen := Found{ID: id, Name: n4000Name, USB: []string{n4000PI0, n4000PI1}, Answering: true}
+	other := Found{ID: ScannerID("other"), Name: "Another scanner", USB: []string{`\\?\USB#VID_1111&PID_2222&PI_00#1&2&0&0000#{g}`}, Answering: true}
+	a.mergeInventoryLocked([]Found{chosen, other}, time.Now())
+	a.local.ScannerID = id
+
+	inLook, release := make(chan struct{}), make(chan struct{})
+	a.opt.Look = func(context.Context, string, Skip, map[string]string, func(string, ...any)) []Found {
+		close(inLook)
+		<-release
+		return []Found{chosen}
+	}
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		a.inventoryPass(ctx)
+	}()
+	<-inLook
+	go func() {
+		defer wg.Done()
+		a.openChosen(ctx, id)
+	}()
+	time.Sleep(100 * time.Millisecond) // openChosen waits for lookMu
+	close(release)
+	wg.Wait()
+	a.mu.Lock()
+	g, _ := a.foundLocked(id)
+	a.mu.Unlock()
+	if g.Answering || g.Reason != ReasonWindows {
+		t.Fatalf("%+v", g)
 	}
 }
