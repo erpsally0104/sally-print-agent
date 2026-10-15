@@ -125,7 +125,7 @@ func TestOpenChosenMarksTheEntryWhenUSBCannotBeUsed(t *testing.T) {
 	a.local.ScannerID = id
 	a.probes.put(usbKey, probe{caps: &escl.Capabilities{UUID: usbUUID}, answering: true, at: time.Now()})
 	a.probes.put(netKey, probe{at: time.Now()})
-	if sc := a.openChosen(context.Background(), id); sc != nil {
+	if sc, _ := a.openChosen(context.Background(), id); sc != nil {
 		t.Fatal("opened")
 	}
 	if g, _ := a.foundLocked(id); g.Answering || g.Reason != ReasonWindows {
@@ -144,7 +144,7 @@ func TestOpenChosenMarksTheEntryWhenUSBCannotBeUsed(t *testing.T) {
 	b.mergeInventoryLocked([]Found{n}, time.Now())
 	b.local.ScannerID = n.ID
 	b.probes.put(netKey, probe{answering: true, at: time.Now()})
-	if sc := b.openChosen(context.Background(), n.ID); sc != nil {
+	if sc, _ := b.openChosen(context.Background(), n.ID); sc != nil {
 		t.Fatal("opened")
 	}
 	if g, _ := b.foundLocked(n.ID); !g.Answering || g.Reason != "" {

@@ -6,6 +6,7 @@ package desktop
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestAChosenLastResortIDThatNowAnswersUnderItsUUIDIsNotHeldByWindows(t *test
 		if req, _ := a.report(); req.Scanner.Problem != "" {
 			t.Fatalf("pass %d: %q", i, req.Scanner.Problem)
 		}
-		if sc := a.openChosen(ctx, stale); sc != nil {
+		if sc, _ := a.openChosen(ctx, stale); sc != nil {
 			t.Fatal("opened another scanner")
 		}
 		if f, _ := a.foundLocked(stale); f.Reason != "" {
@@ -67,7 +68,7 @@ func TestAChosenLastResortIDThatNowAnswersUnderItsUUIDIsNotHeldByWindows(t *test
 		if f, _ := a.foundLocked(stale); f.Answering || f.Reason != ReasonWindows {
 			t.Fatalf("refused, pass %d: %+v", i, f)
 		}
-		if sc := a.openChosen(ctx, stale); sc != nil {
+		if sc, _ := a.openChosen(ctx, stale); sc != nil {
 			t.Fatal("opened")
 		}
 		if f, _ := a.foundLocked(stale); f.Reason != ReasonWindows {
@@ -136,7 +137,7 @@ func TestAPassKeepsTheReasonOfAChosenScannerAlsoOnTheNetwork(t *testing.T) {
 	a.inventoryPass(ctx)
 	notFound := linkProblem[ReasonNotFound]
 	for i := 0; i < 2; i++ {
-		if sc := a.openChosen(ctx, id); sc != nil {
+		if sc, _ := a.openChosen(ctx, id); sc != nil {
 			t.Fatal("opened")
 		}
 		a.inventoryPass(ctx)
@@ -208,7 +209,7 @@ func TestAPassKeepsTheReasonOfTheChosenScannersRefusedOpen(t *testing.T) {
 	}
 	a.local.ScannerID = id
 	u.set(func(u *fakeUSB) { u.do = map[string]string{n4000PI0: refusesRead, n4000PI1: refusesRead} })
-	if sc := a.openChosen(ctx, id); sc != nil {
+	if sc, _ := a.openChosen(ctx, id); sc != nil {
 		t.Fatal("opened")
 	}
 	if f, _ := a.foundLocked(id); f.Reason != ReasonWindows {
@@ -233,5 +234,42 @@ func TestAPassKeepsTheReasonOfTheChosenScannersRefusedOpen(t *testing.T) {
 	}
 	if n := len(u.openedNow()); n != opened {
 		t.Fatalf("the pass opened the device again: %v", u.openedNow()[opened:])
+	}
+}
+
+// The check-in that says why the chosen scanner cannot be used carries
+// that scanner's view, not the one of the scanner open before.
+func TestTheCheckInThatSaysWhyCarriesTheChosenScanner(t *testing.T) {
+	installUSB(t, n4000(refusesRead, refusesRead))
+	a := pairedAgent(t, "http://127.0.0.1:1", nil)
+	id := ScannerID("uuid:" + usbUUID)
+	a.mergeInventoryLocked([]Found{{ID: id, Name: n4000Name, USB: []string{n4000PI0, n4000PI1}, Answering: true}}, time.Now())
+	a.local.ScannerID, a.local.ScannerName = id, n4000Name
+	a.scanner = scannerView{Kind: "NETWORK", Name: "Back office scanner", ID: ScannerID("x"), State: "IDLE"}
+
+	early := make(chan bool, 1)
+	a.opt.Logf = func(format string, _ ...any) {
+		if strings.HasPrefix(format, "the chosen scanner ") {
+			early <- len(a.hbKick) > 0
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.scannerLoop(ctx)
+	}()
+	defer func() { cancel(); <-done }()
+	if <-early {
+		t.Fatal("kicked before the chosen scanner's view was set")
+	}
+	select {
+	case <-a.hbKick:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no check-in")
+	}
+	req, _ := a.report()
+	if req.Scanner.ID != id || req.Scanner.Kind != "USB" || req.Scanner.State != "OFFLINE" || req.Scanner.Problem != linkProblem[ReasonWindows] {
+		t.Fatalf("%+v", req.Scanner)
 	}
 }

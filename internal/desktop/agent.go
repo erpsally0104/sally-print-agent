@@ -1331,7 +1331,8 @@ func (a *Agent) scannerLoop(ctx context.Context) {
 				continue
 			}
 		} else {
-			sc = a.openChosen(ctx, chosen)
+			var changed bool
+			sc, changed = a.openChosen(ctx, chosen)
 			if sc == nil {
 				a.mu.Lock()
 				kind := "NONE"
@@ -1342,6 +1343,11 @@ func (a *Agent) scannerLoop(ctx context.Context) {
 				}
 				a.scanner = scannerView{Kind: kind, Name: a.local.ScannerName, ID: chosen, State: "OFFLINE"}
 				a.mu.Unlock()
+				// Kicked only now, so the check-in that says why carries
+				// the chosen scanner, not the one open before.
+				if changed {
+					a.kickHeartbeat()
+				}
 				if !a.sleepChosen(ctx, 20*time.Second) {
 					return
 				}
@@ -1378,8 +1384,10 @@ func (a *Agent) scannerLoop(ctx context.Context) {
 }
 
 // openChosen opens the chosen scanner, looking for it first when it is not
-// on the list. nil when it does not answer.
-func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
+// on the list. nil when it does not answer; changed then says the list
+// now says why, which the caller tells Sally once the scanner's view is
+// set.
+func (a *Agent) openChosen(ctx context.Context, chosen string) (sc *Scanner, changed bool) {
 	a.mu.Lock()
 	f, ok := a.foundLocked(chosen)
 	a.mu.Unlock()
@@ -1395,11 +1403,10 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
 		a.mu.Unlock()
 	}
 	if !ok {
-		return nil
+		return nil, false
 	}
 	a.lookMu.Lock()
 	sc, err := a.opt.OpenFound(ctx, f, a.logf)
-	changed := false
 	if err == nil {
 		a.mu.Lock()
 		a.openSkip = skipOf(sc)
@@ -1426,14 +1433,11 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
 		a.mu.Unlock()
 	}
 	a.lookMu.Unlock()
-	if changed {
-		a.kickHeartbeat()
-	}
 	if err != nil {
 		a.logf("the chosen scanner %s is not answering: %v", f.Name, err)
-		return nil
+		return nil, changed
 	}
-	return sc
+	return sc, false
 }
 
 // openedLocked records the open scanner: its view, its list entry, and
