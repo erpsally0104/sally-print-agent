@@ -803,7 +803,7 @@ func (a *Agent) report() (sally.HeartbeatRequest, map[string]uint64) {
 	req.Scanner = &sally.Scanner{
 		Kind: a.scanner.Kind, Name: cutRunes(a.scanner.Name, 120), State: a.scanner.State,
 		AdfLoaded: a.scanner.AdfLoaded, Scanning: a.scanner.Scanning,
-		ID: a.scanner.ID, Problem: problemForSally(a.problem), Held: a.machine.Held(),
+		ID: a.scanner.ID, Problem: problemForSally(a.scannerProblemLocked()), Held: a.machine.Held(),
 	}
 	if a.job != nil && a.scanner.Scanning {
 		j := *a.job
@@ -843,6 +843,59 @@ func (a *Agent) report() (sally.HeartbeatRequest, map[string]uint64) {
 		req.LocalActions = append([]sally.LocalAction(nil), a.actions...)
 	}
 	return req, sent
+}
+
+// The scanner problem when a USB scanner cannot be used: never a name, a
+// path or an error.
+var linkProblem = map[string]string{
+	ReasonNotFound: "The chosen scanner is not found on USB. Check that it is plugged in and switched on, unplug it and plug it back in, or choose another scanner.",
+	ReasonWindows:  "Windows is not letting Sally Desktop use the scanner's USB connection. Unplug the scanner and plug it back in, or use it over the network.",
+}
+
+// scannerProblemLocked is the scanner problem Sally gets: why a USB
+// scanner cannot be used when that is known (a jam still open wins),
+// otherwise the last problem.
+func (a *Agent) scannerProblemLocked() string {
+	if r, _ := a.linkLocked(); r != "" && !a.jamOpen {
+		if p := linkProblem[r]; p != "" {
+			return p
+		}
+	}
+	return a.problem
+}
+
+// linkLocked says why no scanner can be used over USB, and names it: ""
+// while a scanner is open. With a scanner chosen it is the chosen entry's
+// reason while it is not answering; with Automatic, that of the first USB
+// entry Windows holds that once answered here (in KnownScanners, so not an
+// IPP-over-USB printer).
+func (a *Agent) linkLocked() (reason, name string) {
+	if a.scannerOpen {
+		return "", ""
+	}
+	list := a.orderedLocked()
+	if chosen := a.local.ScannerID; chosen != "" {
+		for _, f := range list {
+			if f.ID == chosen {
+				if f.Answering {
+					return "", ""
+				}
+				return f.Reason, f.Name
+			}
+		}
+		return "", ""
+	}
+	for _, f := range list {
+		if len(f.USB) == 0 || f.Answering || f.Reason != ReasonWindows {
+			continue
+		}
+		for _, p := range f.USB {
+			if _, ok := a.local.KnownScanners[usbKeys(usbscan.DeviceKey(p)).key]; ok && p != "" {
+				return f.Reason, f.Name
+			}
+		}
+	}
+	return "", ""
 }
 
 // lapseLocked reports each Scan now whose 2 minutes passed without paper:
@@ -1078,7 +1131,11 @@ type View struct {
 	ChosenAt   *time.Time
 	// ChosenMissing: a scanner is chosen and it is not answering.
 	ChosenMissing bool
-	Scanners      []ScannerRow
+	// LinkReason says why a USB scanner cannot be used (ReasonNotFound,
+	// ReasonWindows or ""), and LinkName names it.
+	LinkReason string
+	LinkName   string
+	Scanners   []ScannerRow
 
 	Paused          bool
 	PausedUntil     *time.Time
@@ -1126,10 +1183,12 @@ type ScannerRow struct {
 	Kind      string // USB | NETWORK | USB and network
 	Detail    string
 	Answering bool
-	Feeder    *bool
-	Stable    bool
-	InUse     bool
-	Chosen    bool
+	// Reason says why it is not answering, when known.
+	Reason string
+	Feeder *bool
+	Stable bool
+	InUse  bool
+	Chosen bool
 }
 
 // Snapshot returns the current view.
@@ -1215,6 +1274,7 @@ func (a *Agent) Snapshot() View {
 		v.ChosenAt = &t
 	}
 	v.ChosenMissing = a.local.ScannerID != "" && !a.scannerOpen
+	v.LinkReason, v.LinkName = a.linkLocked()
 	inUse := ""
 	if a.scannerOpen {
 		inUse = a.scanner.ID
@@ -1224,10 +1284,14 @@ func (a *Agent) Snapshot() View {
 		if len(f.USB) > 0 && len(f.Net) > 0 {
 			kind = "USB and network"
 		}
-		v.Scanners = append(v.Scanners, ScannerRow{
+		row := ScannerRow{
 			ID: f.ID, Name: f.Name, Kind: kind, Detail: safeDetail(f.Detail), Answering: f.Answering,
 			Feeder: f.Feeder, Stable: f.Stable, InUse: f.ID == inUse, Chosen: f.ID == a.local.ScannerID,
-		})
+		}
+		if !f.Answering {
+			row.Reason = f.Reason
+		}
+		v.Scanners = append(v.Scanners, row)
 	}
 	return v
 }
@@ -1335,12 +1399,34 @@ func (a *Agent) openChosen(ctx context.Context, chosen string) *Scanner {
 	}
 	a.lookMu.Lock()
 	sc, err := a.opt.OpenFound(ctx, f, a.logf)
+	changed := false
 	if err == nil {
 		a.mu.Lock()
 		a.openSkip = skipOf(sc)
 		a.mu.Unlock()
+	} else if r := reasonOf(err); r != "" {
+		// The list says why at once, and the next pass probes it again
+		// instead of trusting an answer from before.
+		a.mu.Lock()
+		before := signature(a.inventory)
+		for i := range a.inventory {
+			if a.inventory[i].ID == f.ID {
+				a.inventory[i].Answering, a.inventory[i].Reason = false, r
+			}
+		}
+		for _, p := range f.USB {
+			a.probes.forgetAnswer(usbKeys(usbscan.DeviceKey(p)).key)
+		}
+		for _, b := range f.Net {
+			a.probes.forgetAnswer(b.keys.key)
+		}
+		changed = signature(a.inventory) != before
+		a.mu.Unlock()
 	}
 	a.lookMu.Unlock()
+	if changed {
+		a.kickHeartbeat()
+	}
 	if err != nil {
 		a.logf("the chosen scanner %s is not answering: %v", f.Name, err)
 		return nil

@@ -541,3 +541,67 @@ func TestTheStampIgnoresTheSideCountButNotTheList(t *testing.T) {
 		t.Fatalf("live %s", body)
 	}
 }
+
+func TestTheStatusPageSaysWhyAUSBScannerCannotBeUsed(t *testing.T) {
+	s, d := scanServer(t)
+	d.view.ScannerKind, d.view.ScannerName, d.view.ScannerState = "USB", "HP ScanJet Pro N4000 snw1", "OFFLINE"
+	d.view.Scanners = []desktop.ScannerRow{
+		{ID: "sc-0123456789abcdef0123", Name: "HP ScanJet Pro N4000 snw1", Kind: "USB", Reason: desktop.ReasonNotFound, Chosen: true},
+		{ID: "sc-bbbbbbbbbbbbbbbbbbbb", Name: "Second scanner", Kind: "USB", Reason: desktop.ReasonWindows},
+		{ID: "sc-aaaaaaaaaaaaaaaaaaaa", Name: "Back office", Kind: "network"},
+	}
+	p := page(s)
+	for _, want := range []string{"USB · not found on USB", "USB · USB connection blocked by Windows", "network · not answering"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+
+	v := desktop.View{ChosenMissing: true, ChosenName: "HP ScanJet Pro N4000 snw1", ScannerKind: "USB", ScannerState: "OFFLINE"}
+	if got := scannerLine(v); got != "HP ScanJet Pro N4000 snw1 is not answering. Sally Desktop waits for it and does not switch to another scanner. Choose Automatic to use whichever scanner answers." {
+		t.Errorf("%q", got)
+	}
+	v.LinkReason = desktop.ReasonNotFound
+	if got := scannerLine(v); got != "HP ScanJet Pro N4000 snw1 is not found on USB. Check that it is plugged in and switched on, or unplug it and plug it back in. Sally Desktop waits for it and does not switch to another scanner. Choose Automatic to use whichever scanner answers." {
+		t.Errorf("%q", got)
+	}
+	windows := "HP ScanJet Pro N4000 snw1 is plugged in, but Windows is not letting Sally Desktop use its USB connection: another scan app may be using it, or Windows switched it to its maker's mode. Unplug it and plug it back in, or, if it is on your network, choose it there or type its address below."
+	v.LinkReason = desktop.ReasonWindows
+	if got := scannerLine(v); got != windows {
+		t.Errorf("%q", got)
+	}
+	auto := desktop.View{ScannerKind: "NONE", ScannerState: "OFFLINE", LinkReason: desktop.ReasonWindows, LinkName: "HP ScanJet Pro N4000 snw1"}
+	if got := scannerLine(auto); got != windows {
+		t.Errorf("automatic: %q", got)
+	}
+
+	// Automatic, nothing open: the warn dot only when Windows holds one.
+	d.view = auto
+	d.view.Scanning = true
+	if !strings.Contains(page(s), `<span class="dot warn"></span>`) {
+		t.Error("the warn dot")
+	}
+	d.view.LinkReason, d.view.LinkName = "", ""
+	if p := page(s); !strings.Contains(p, `<span class="dot "></span>`) || !strings.Contains(p, "No scanner found.") {
+		t.Error("no scanner, no reason: no dot")
+	}
+}
+
+func TestTheStampChangesWithWhyAUSBScannerCannotBeUsed(t *testing.T) {
+	v := desktop.View{ScannerKind: "NONE", Scanners: []desktop.ScannerRow{{ID: "sc-1"}}}
+	base := statusStamp(v)
+	v.LinkReason = desktop.ReasonWindows
+	withReason := statusStamp(v)
+	if withReason == base {
+		t.Fatal("LinkReason must change the stamp")
+	}
+	v.LinkName = "HP ScanJet Pro N4000 snw1"
+	if statusStamp(v) == withReason {
+		t.Fatal("LinkName must change the stamp")
+	}
+	v.LinkReason, v.LinkName = "", ""
+	v.Scanners[0].Reason = desktop.ReasonNotFound
+	if statusStamp(v) == base {
+		t.Fatal("a row's reason must change the stamp")
+	}
+}

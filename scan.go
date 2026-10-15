@@ -196,8 +196,9 @@ func statusStamp(v desktop.View) string {
 	add(strconv.FormatBool(v.Paused) + strconv.FormatBool(v.HeldWhilePaused) + v.Pending + strconv.FormatBool(v.PendingFromSally))
 	add(v.ScannerID + "/" + v.HoldState + "/" + v.Stopped + "/" + v.StoppedBy)
 	add(v.ChosenID + "/" + v.ChosenName + "/" + v.ChosenBy + "/" + strconv.FormatBool(v.ChosenMissing))
+	add(v.LinkReason + "/" + v.LinkName)
 	for _, r := range v.Scanners {
-		add(r.ID + r.Name + r.Kind + r.Detail + strconv.FormatBool(r.Answering) + strconv.FormatBool(r.InUse) + strconv.FormatBool(r.Chosen))
+		add(r.ID + r.Name + r.Kind + r.Detail + strconv.FormatBool(r.Answering) + r.Reason + strconv.FormatBool(r.InUse) + strconv.FormatBool(r.Chosen))
 	}
 	add(strconv.FormatBool(v.AutoStart) + strconv.Itoa(v.StartDelaySec))
 	add(v.Receipt + v.Problem)
@@ -337,7 +338,7 @@ func (s *server) scanCard() scanCard {
 	c.Dot = "warn"
 	switch {
 	case v.ChosenMissing:
-	case v.ScannerKind == "NONE" || v.ScannerKind == "":
+	case (v.ScannerKind == "NONE" || v.ScannerKind == "") && v.LinkReason != desktop.ReasonWindows:
 		c.Dot = ""
 	case v.ScanRunning || v.ScannerState == "IDLE" || v.ScannerState == "PROCESSING":
 		c.Dot = "ok"
@@ -392,7 +393,14 @@ func (s *server) scanCard() scanCard {
 			tags = append(tags, "in use")
 		}
 		if !r.Answering {
-			tags = append(tags, "not answering")
+			switch r.Reason {
+			case desktop.ReasonNotFound:
+				tags = append(tags, "not found on USB")
+			case desktop.ReasonWindows:
+				tags = append(tags, "USB connection blocked by Windows")
+			default:
+				tags = append(tags, "not answering")
+			}
 		}
 		if r.Feeder != nil && !*r.Feeder {
 			tags = append(tags, "no document feeder")
@@ -429,14 +437,28 @@ func (s *server) scanCard() scanCard {
 }
 
 // scannerLine is the scanner's line on the card: its name, how it is
-// reached and what it is doing.
+// reached and what it is doing, or why it cannot be used.
 func scannerLine(v desktop.View) string {
+	const waits = " Sally Desktop waits for it and does not switch to another scanner. Choose Automatic to use whichever scanner answers."
 	if v.ChosenMissing {
 		name := v.ChosenName
 		if name == "" {
 			name = "The chosen scanner"
 		}
-		return name + " is not answering. Sally Desktop waits for it and does not switch to another scanner. Choose Automatic to use whichever scanner answers."
+		switch v.LinkReason {
+		case desktop.ReasonNotFound:
+			return name + " is not found on USB. Check that it is plugged in and switched on, or unplug it and plug it back in." + waits
+		case desktop.ReasonWindows:
+			return windowsHoldsLine(name)
+		}
+		return name + " is not answering." + waits
+	}
+	if (v.ScannerKind == "NONE" || v.ScannerKind == "") && v.LinkReason == desktop.ReasonWindows {
+		name := v.LinkName
+		if name == "" {
+			name = "The USB scanner"
+		}
+		return windowsHoldsLine(name)
 	}
 	kind := map[string]string{"USB": "USB", "NETWORK": "network"}[v.ScannerKind]
 	state := ""
@@ -466,6 +488,13 @@ func scannerLine(v desktop.View) string {
 		return v.ScannerName + " · " + kind + " · " + state
 	}
 	return state
+}
+
+// windowsHoldsLine says that Windows will not let the agent use a
+// scanner's USB connection, with what is known of why.
+func windowsHoldsLine(name string) string {
+	return name + " is plugged in, but Windows is not letting Sally Desktop use its USB connection: another scan app may be using it, or Windows switched it to its maker's mode. " +
+		"Unplug it and plug it back in, or, if it is on your network, choose it there or type its address below."
 }
 
 func pagesWord(n int) string { return plural2(n, "page", "pages") }

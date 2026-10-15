@@ -247,6 +247,19 @@ func (c *ProbeCache) put(key string, p probe) {
 	c.m[key] = p
 }
 
+// forgetAnswer drops the probe of key if it answered, so the next pass
+// probes it again.
+func (c *ProbeCache) forgetAnswer(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p, ok := c.m[key]; ok && p.answering {
+		delete(c.m, key)
+	}
+}
+
 // forgetUSB drops the probes of USB devices that are not in present (cache
 // keys), so a device that comes back is probed at once.
 func (c *ProbeCache) forgetUSB(present map[string]bool) {
